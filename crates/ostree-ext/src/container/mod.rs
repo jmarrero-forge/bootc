@@ -476,6 +476,7 @@ pub fn version_for_config(config: &oci_spec::image::ImageConfiguration) -> Optio
     None
 }
 
+pub mod composefs_import;
 pub mod deploy;
 mod encapsulate;
 pub use encapsulate::*;
