@@ -11,6 +11,11 @@ use rustix::fs::{Mode, OFlags};
 
 use super::LOST_AND_FOUND;
 
+/// Advertised by `bootc container inspect`, so that tools preparing a target
+/// for `install to-filesystem` know that mounting /var filesystems is useful.
+/// Older versions leave such filesystems empty, or reject them entirely.
+pub(super) const FEATURE: &str = "initialize-var-mounts";
+
 const VAR: &str = "var";
 
 /// The path of a mount (relative to /var) from the installation root.

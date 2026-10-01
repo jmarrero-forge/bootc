@@ -225,6 +225,8 @@ const ALONGSIDE_ROOT_MOUNT: &str = "/target";
 pub(crate) const DESTRUCTIVE_CLEANUP: &str = "etc/bootc-destructive-cleanup";
 /// This is an ext4 special directory we need to ignore.
 const LOST_AND_FOUND: &str = "lost+found";
+/// Optional `bootc install` behaviors, advertised by `bootc container inspect`.
+pub(crate) const INSTALL_FEATURES: &[&str] = &[var_mounts::FEATURE];
 /// The mount path for selinux
 const SELINUXFS: &str = "/sys/fs/selinux";
 /// The mount path for uefi
