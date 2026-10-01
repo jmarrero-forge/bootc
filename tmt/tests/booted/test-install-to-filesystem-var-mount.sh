@@ -142,7 +142,7 @@ mkfs.ext4 -F /dev/BL/root02
 
 # Get UUIDs for bootc install
 ROOT_UUID=$(blkid -s UUID -o value /dev/BL/root02)
-BOOT_UUID=$(blkid -s UUID -o value "$EFI_PART")
+BOOT_UUID=$(blkid -s UUID -o value "$BOOT_PART")
 
 # Mount the partitions
 mkdir -p /var/mnt/target
