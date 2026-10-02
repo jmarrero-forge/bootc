@@ -60,7 +60,7 @@ def required-old-bootc-sha256 [] {
 }
 
 def assert-old-fixture [] {
-    let version = (bootc --version | str trim)
+    let version = (bootc --version | lines | first | str trim)
     assert equal $version "bootc 1.16.0"
     let rpm_version = (rpm -q --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n' bootc | str trim)
     let binary_sha256 = (sha256sum /usr/bin/bootc | split row " " | first | str downcase)

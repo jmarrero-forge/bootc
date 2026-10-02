@@ -29,6 +29,12 @@ line is fixed, so the mount cannot be recorded: an explicit spec is an error
 and discovery is skipped. `--var-mount-spec` is also an error when installing
 to the host root, over an existing ostree system or with `--replace=alongside`.
 
+Tools can tell whether a bootc binary supports this by looking for
+`install-var-mount` in the `Features:` list of `bootc --version`. It covers
+both /var filesystems that bootc mounts (`--var-mount-spec` or a discovered
+Variable Data Partition) and ones the caller mounted; older versions leave
+such filesystems empty, or reject them entirely.
+
 Alternatively, mount filesystems for `/var` or its subdirectories beneath *ROOT_PATH*
 before invoking this command. On a fresh installation, bootc initializes
 empty mounted trees from the image's initial `/var` contents, including
