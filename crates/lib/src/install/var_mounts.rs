@@ -1,5 +1,6 @@
 //! Initialize caller-mounted /var filesystems from the installed deployment.
 
+use std::cell::Cell;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
@@ -9,7 +10,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use cap_std_ext::{cap_std::fs::Dir, cmdext::CapStdExtCommandExt, dirext::CapStdExtDirExt};
 use rustix::fs::{Mode, OFlags};
 
-use super::LOST_AND_FOUND;
+use super::{LOST_AND_FOUND, MountSpec};
 
 /// Advertised by `bootc container inspect`, so that tools preparing a target
 /// for `install to-filesystem` know that mounting /var filesystems is useful.
@@ -24,6 +25,219 @@ pub(super) fn target_path(mount: &Utf8Path) -> Utf8PathBuf {
         VAR.into()
     } else {
         Utf8Path::new(VAR).join(mount)
+    }
+}
+
+/// What to do about /var in the target of `install to-filesystem`.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Plan {
+    /// Leave /var alone, as bootc did before supporting separate /var.
+    Disabled,
+    /// Initialize whatever filesystems the caller already mounted at or below /var.
+    CallerMounted,
+    /// Mount this source at /var, then initialize it.
+    Mount(String),
+}
+
+/// Filesystems that we are willing to mount on /var when we discover a
+/// Variable Data Partition, as opposed to e.g. LUKS, LVM or swap signatures.
+const MOUNTABLE_FSTYPES: &[&str] = &["ext2", "ext3", "ext4", "xfs", "btrfs", "f2fs"];
+
+/// Decide the plan from `--var-mount-spec` (or its config file equivalent).
+///
+/// An empty spec disables everything, including discovery of a DPS Variable
+/// Data Partition on the disk(s) backing the root, which is used when no
+/// spec was given and nothing is mounted at or below /var yet.
+///
+/// If `cannot_record` is set, the installed system has no way to be told to
+/// mount /var (sealed UKIs have a fixed command line), so a spec is an
+/// error and discovery is skipped.
+pub(super) fn plan(
+    configured: Option<&str>,
+    caller_mounts: bool,
+    cannot_record: bool,
+    find_var_partition: impl FnOnce() -> Result<Option<bootc_blockdev::Device>>,
+) -> Result<Plan> {
+    match configured {
+        Some("") => return Ok(Plan::Disabled),
+        Some(spec) if cannot_record => bail!(
+            "Cannot mount {spec} on /var: this installation cannot record the mount \
+             (composefs with a UKI has a fixed kernel command line); mount it before \
+             installing and set it up in the image instead"
+        ),
+        Some(spec) => return Ok(Plan::Mount(spec.to_owned())),
+        None if caller_mounts => return Ok(Plan::CallerMounted),
+        None => {}
+    }
+    // Discovery is opportunistic: failing to probe the disks is not a reason
+    // to fail an install that never asked for a separate /var.
+    let part = match find_var_partition() {
+        Ok(Some(part)) => part,
+        Ok(None) => return Ok(Plan::CallerMounted),
+        Err(e) => {
+            tracing::warn!("Looking for a Variable Data Partition: {e:#}");
+            return Ok(Plan::CallerMounted);
+        }
+    };
+    if cannot_record {
+        tracing::warn!(
+            "Ignoring Variable Data Partition {}: the mount cannot be recorded in a composefs UKI",
+            part.path()
+        );
+        return Ok(Plan::CallerMounted);
+    }
+    // gpt-auto-generator only mounts a /var partition whose PARTUUID matches
+    // the machine-id, so we always record the mount ourselves.
+    match (&part.partuuid, part.fstype.as_deref()) {
+        (Some(partuuid), Some(fstype)) if MOUNTABLE_FSTYPES.contains(&fstype) => {
+            println!("Using Variable Data Partition {} for /var", part.path());
+            Ok(Plan::Mount(format!("PARTUUID={partuuid}")))
+        }
+        _ => {
+            tracing::warn!(
+                "Ignoring Variable Data Partition {}: its contents ({}) are not a supported filesystem",
+                part.path(),
+                part.fstype.as_deref().unwrap_or("empty")
+            );
+            Ok(Plan::CallerMounted)
+        }
+    }
+}
+
+/// A /var filesystem that bootc mounted itself. Dropping it undoes the mount
+/// (and the creation of the mountpoint), so an error does not leave it behind.
+#[derive(Debug)]
+pub(super) struct Mounted {
+    /// How the booted system should mount it.
+    pub(super) spec: MountSpec,
+    root_path: Utf8PathBuf,
+    root: Dir,
+    /// We mounted it (it was not already a mountpoint).
+    mounted: Cell<bool>,
+    /// We created the mountpoint directory.
+    created: Cell<bool>,
+}
+
+/// Mount `source` on the target's /var, unless something is mounted there already.
+pub(super) fn mount(root_path: &Utf8Path, root: &Dir, source: &str) -> Result<Mounted> {
+    let var = root_path.join(VAR);
+    let existing = discover(root_path)?;
+    let var_is_mount = existing.iter().any(|m| m.as_str().is_empty());
+    // Mounting over caller mounts below /var would hide them.
+    if !var_is_mount && !existing.is_empty() {
+        bail!(
+            "Cannot mount {source} on {var}: {} is already mounted below it",
+            root_path.join(target_path(&existing[0]))
+        );
+    }
+    let created = match root.symlink_metadata_optional(VAR)? {
+        Some(meta) if meta.is_dir() => false,
+        Some(_) => bail!("{var} exists but is not a directory"),
+        None => {
+            root.create_dir(VAR)
+                .with_context(|| format!("Creating {var}"))?;
+            true
+        }
+    };
+    if var_is_mount {
+        check_mounted_matches(&var, source)?;
+    }
+    let guard = Mounted {
+        spec: MountSpec::new(source, "/var"),
+        root_path: root_path.to_owned(),
+        root: root.try_clone()?,
+        mounted: Cell::new(false),
+        created: Cell::new(created),
+    };
+    if !var_is_mount {
+        println!("Mounting {source} on {var}");
+        bootc_mount::mount(source, &var)?;
+        guard.mounted.set(true);
+    }
+    Ok(guard)
+}
+
+/// Resolve a mount source (`/dev/...`, `UUID=...`, `LABEL=...`) to a canonical device path.
+fn resolve_source(source: &str) -> Result<Utf8PathBuf> {
+    let dev = if source.starts_with('/') {
+        source.to_owned()
+    } else {
+        Command::new("findfs")
+            .arg(source)
+            .run_get_string()
+            .with_context(|| format!("Resolving {source}"))?
+            .trim()
+            .to_owned()
+    };
+    Utf8Path::new(&dev)
+        .canonicalize_utf8()
+        .with_context(|| format!("Resolving {dev}"))
+}
+
+/// A caller already mounted /var: make sure it is the filesystem the
+/// spec names, since we record the spec for the booted system.
+fn check_mounted_matches(var: &Utf8Path, source: &str) -> Result<()> {
+    let mounted = bootc_mount::inspect_filesystem(var)?;
+    // btrfs sources look like /dev/vda3[/subvol]
+    let mounted_source = mounted.source.split('[').next().unwrap_or_default();
+    if !mounted_source.starts_with("/dev/") {
+        bail!(
+            "/var is already mounted from {} (not a block device), which cannot match \
+             --var-mount-spec {source}",
+            mounted.source
+        );
+    }
+    if resolve_source(source)? != resolve_source(mounted_source)? {
+        bail!(
+            "/var is already mounted from {} but --var-mount-spec names {source}",
+            mounted.source
+        );
+    }
+    Ok(())
+}
+
+impl Mounted {
+    /// Undo [`mount`], leaving the target as we found it.
+    pub(super) fn unmount(&self) -> Result<()> {
+        let path = self.root_path.join(VAR);
+        if self.mounted.get() {
+            Command::new("umount")
+                .arg(&path)
+                .run_inherited_with_cmd_context()?;
+            self.mounted.set(false);
+        }
+        if self.created.get() {
+            self.root
+                .remove_dir(VAR)
+                .with_context(|| format!("Removing {path}"))?;
+            self.created.set(false);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Mounted {
+    fn drop(&mut self) {
+        if let Err(e) = self.unmount() {
+            tracing::warn!("Cleaning up /var mount: {e:#}");
+            // Do not leave a mounted /var behind on the target: detach it lazily.
+            if self.mounted.get() {
+                let path = self.root_path.join(VAR);
+                match Command::new("umount")
+                    .arg("--lazy")
+                    .arg(&path)
+                    .run_inherited()
+                {
+                    Ok(()) => {
+                        self.mounted.set(false);
+                        if let Err(e) = self.unmount() {
+                            tracing::warn!("Cleaning up /var mountpoint: {e:#}");
+                        }
+                    }
+                    Err(e) => tracing::warn!("Lazily unmounting {path}: {e:#}"),
+                }
+            }
+        }
     }
 }
 
@@ -197,6 +411,65 @@ mod tests {
     use cap_std_ext::cap_std::ambient_authority;
     use cap_std_ext::cap_std::fs::{MetadataExt, Permissions, PermissionsExt};
     use cap_std_ext::cap_tempfile::TempDir;
+
+    fn partition(fstype: Option<&str>) -> bootc_blockdev::Device {
+        serde_json::from_value(serde_json::json!({
+            "name": "vda4", "path": "/dev/vda4", "size": 1, "partuuid": "abcd",
+            "fstype": fstype,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn test_plan() {
+        let none = || Ok(None);
+        let part = |fstype| move || Ok(Some(partition(fstype)));
+        let mount = |s: &str| Plan::Mount(s.into());
+        // An empty spec wins over discovery; an explicit one skips it.
+        assert_eq!(
+            plan(Some(""), false, false, part(Some("ext4"))).unwrap(),
+            Plan::Disabled
+        );
+        assert_eq!(
+            plan(Some("UUID=1"), false, false, none).unwrap(),
+            mount("UUID=1")
+        );
+        assert_eq!(plan(None, false, false, none).unwrap(), Plan::CallerMounted);
+        // Discovery needs a filesystem we can mount
+        assert_eq!(
+            plan(None, false, false, part(Some("xfs"))).unwrap(),
+            mount("PARTUUID=abcd")
+        );
+        for fstype in [None, Some("crypto_LUKS"), Some("swap"), Some("LVM2_member")] {
+            assert_eq!(
+                plan(None, false, false, part(fstype)).unwrap(),
+                Plan::CallerMounted,
+                "{fstype:?}"
+            );
+        }
+        // Discovery is for when the caller mounted nothing at /var
+        assert_eq!(
+            plan(None, true, false, part(Some("ext4"))).unwrap(),
+            Plan::CallerMounted
+        );
+        // Without a way to record the mount, discovery is skipped and a spec is an error
+        assert_eq!(
+            plan(None, false, true, part(Some("ext4"))).unwrap(),
+            Plan::CallerMounted
+        );
+        assert!(plan(Some("UUID=1"), false, true, none).is_err());
+        assert_eq!(plan(Some(""), false, true, none).unwrap(), Plan::Disabled);
+        // Failing to look for a partition is not fatal, unless a spec was given
+        let fails = || anyhow::bail!("lsblk failed");
+        assert_eq!(
+            plan(None, false, false, fails).unwrap(),
+            Plan::CallerMounted
+        );
+        assert_eq!(
+            plan(Some("UUID=1"), false, false, fails).unwrap(),
+            mount("UUID=1")
+        );
+    }
 
     #[test]
     fn populate_var_mounts() -> Result<()> {

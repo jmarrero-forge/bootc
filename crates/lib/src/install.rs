@@ -490,6 +490,17 @@ pub(crate) struct InstallTargetFilesystemOpts {
     #[clap(long)]
     pub(crate) boot_mount_spec: Option<String>,
 
+    /// Source device specification to mount at /var, such as `UUID=...`,
+    /// `LABEL=...` or a device path.
+    ///
+    /// bootc mounts it on the target, initializes it from the image's /var
+    /// and records it for mounting at boot. By default, a Variable Data
+    /// Partition (per the Discoverable Partitions Specification) on the disk
+    /// backing the root is used, if there is one. An empty value disables
+    /// that discovery and all /var handling.
+    #[clap(long, alias = "var")]
+    pub(crate) var_mount_spec: Option<String>,
+
     /// Initialize the system in-place; at the moment, only one mode for this is implemented.
     /// In the future, it may also be supported to set up an explicit "dual boot" system.
     #[clap(long)]
@@ -656,6 +667,8 @@ pub(crate) struct State {
     pub(crate) composefs_options: InstallComposefsOpts,
     pub(crate) composefs_fsverity_supported: bool,
     pub(crate) allow_missing_verity_explicit: bool,
+    /// The image has a UKI as its kernel
+    pub(crate) is_uki: bool,
 }
 
 // Shared read-only global state
@@ -1289,15 +1302,22 @@ async fn install_container(
         }
     }
 
-    // Write the entry for /boot to /etc/fstab.  TODO: Encourage OSes to use the karg?
+    // Write the entries for /boot and /var to /etc/fstab.  TODO: Encourage OSes to use the karg?
     // Or better bind this with the grub data.
-    // We omit it if the boot mountspec argument was empty
-    if let Some(boot) = root_setup.boot.as_ref() {
-        if !boot.source.is_empty() {
-            crate::lsm::atomic_replace_labeled(&root, "etc/fstab", 0o644.into(), sepolicy, |w| {
-                writeln!(w, "{}", boot.to_fstab()).map_err(Into::into)
-            })?;
-        }
+    // We omit /boot if the boot mountspec argument was empty
+    let fstab = [root_setup.boot_mount_spec(), root_setup.var_mount_spec()]
+        .into_iter()
+        .flatten()
+        .filter(|m| !m.source.is_empty())
+        .map(|m| m.to_fstab())
+        .collect::<Vec<_>>();
+    if !fstab.is_empty() {
+        crate::lsm::atomic_replace_labeled(&root, "etc/fstab", 0o644.into(), sepolicy, |w| {
+            fstab
+                .iter()
+                .try_for_each(|l| writeln!(w, "{l}"))
+                .map_err(Into::into)
+        })?;
     }
 
     if let Some(contents) = state.root_ssh_authorized_keys.as_deref() {
@@ -1375,6 +1395,8 @@ pub(crate) struct RootSetup {
     /// True if we should skip finalizing
     skip_finalize: bool,
     boot: Option<MountSpec>,
+    /// A /var filesystem that bootc mounted itself for the installation.
+    var: Option<var_mounts::Mounted>,
     pub(crate) kargs: CmdlineOwned,
 }
 
@@ -1393,6 +1415,11 @@ impl RootSetup {
     /// Get the boot mount spec, if a separate /boot partition exists.
     pub(crate) fn boot_mount_spec(&self) -> Option<&MountSpec> {
         self.boot.as_ref()
+    }
+
+    /// Get the mount spec of the /var filesystem that bootc mounted, if any.
+    pub(crate) fn var_mount_spec(&self) -> Option<&MountSpec> {
+        self.var.as_ref().map(|v| &v.spec)
     }
 
     // Drop any open file descriptors and return just the mount path and backing luks device, if any
@@ -1898,6 +1925,7 @@ async fn prepare_install(
             .map(|fs| fs.supports_fsverity())
             .unwrap_or(true),
         allow_missing_verity_explicit,
+        is_uki,
     });
 
     Ok(state)
@@ -2255,6 +2283,10 @@ async fn install_to_filesystem_impl(
     // Unlike root and boot they are not remounted read-only or frozen: they
     // may be bind mounts or lack freeze support, and callers may add content.
     var_mounts::sync(&rootfs.physical_root, &prepared_var_mounts)?;
+    // A /var that we mounted is for the booted system to mount, not ours to leave behind.
+    if let Some(var) = &rootfs.var {
+        var.unmount()?;
+    }
 
     // Finalize mounted filesystems
     if !rootfs.skip_finalize {
@@ -2869,18 +2901,56 @@ pub(crate) async fn install_to_filesystem(
         target_root_path: Some(target_root_path.clone()),
         rootfs_uuid: inspect.uuid.clone(),
         boot,
+        var: None,
         kargs,
         skip_finalize,
     };
 
-    // Reinstalling alongside an existing OS must not initialize its live state.
-    let var_mounts = if targeting_host_root
+    // Reinstalling alongside an existing OS must not touch its live state.
+    let var_plan = if targeting_host_root
         || is_already_ostree
         || matches!(fsopts.replace, Some(ReplaceMode::Alongside))
     {
-        Vec::new()
+        anyhow::ensure!(
+            fsopts.var_mount_spec.as_deref().is_none_or(str::is_empty),
+            "--var-mount-spec is not supported when installing to the host root, over an \
+             existing ostree system or with --replace=alongside"
+        );
+        if let Some(spec) = state
+            .install_config
+            .as_ref()
+            .and_then(|c| c.var_mount_spec.as_deref())
+            .filter(|s| !s.is_empty())
+        {
+            tracing::warn!(
+                "Ignoring var-mount-spec={spec} from the install config: it is not supported \
+                 when installing to the host root, over an existing ostree system or with \
+                 --replace=alongside"
+            );
+        }
+        var_mounts::Plan::Disabled
     } else {
-        var_mounts::discover(&rootfs.physical_root_path)?
+        let config_var_mount_spec = state
+            .install_config
+            .as_ref()
+            .and_then(|c| c.var_mount_spec.as_deref());
+        let spec = fsopts.var_mount_spec.as_deref().or(config_var_mount_spec);
+        let caller_mounts = !var_mounts::discover(&rootfs.physical_root_path)?.is_empty();
+        let cannot_record = state.composefs_options.composefs_backend && state.is_uki;
+        var_mounts::plan(spec, caller_mounts, cannot_record, || {
+            rootfs.device_info.find_colocated_var()
+        })?
+    };
+    if let var_mounts::Plan::Mount(source) = &var_plan {
+        rootfs.var = Some(var_mounts::mount(
+            &rootfs.physical_root_path,
+            &rootfs.physical_root,
+            source,
+        )?);
+    }
+    let var_mounts = match var_plan {
+        var_mounts::Plan::Disabled => Vec::new(),
+        _ => var_mounts::discover(&rootfs.physical_root_path)?,
     };
     install_to_filesystem_impl(&state, &mut rootfs, cleanup, &var_mounts).await?;
 
@@ -2927,6 +2997,7 @@ pub(crate) async fn install_to_existing_root(opts: InstallToExistingRootOpts) ->
             root_path: opts.root_path,
             root_mount_spec: None,
             boot_mount_spec: None,
+            var_mount_spec: None,
             replace: opts.replace,
             skip_finalize: true,
             acknowledge_destructive: opts.acknowledge_destructive,

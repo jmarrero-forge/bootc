@@ -120,8 +120,10 @@ parted -s "$LOOP_DEV" mkpart primary fat32 2MiB 1026MiB
 parted -s "$LOOP_DEV" set 2 esp on
 # Boot partition (1 GiB)
 parted -s "$LOOP_DEV" mkpart primary ext4 1026MiB 2052MiB
-# LVM partition (rest of disk)
-parted -s "$LOOP_DEV" mkpart primary 2052MiB 100%
+# LVM partition
+parted -s "$LOOP_DEV" mkpart primary 2052MiB 90%
+# A spare partition, made a DPS Variable Data Partition by the later scenarios
+parted -s "$LOOP_DEV" mkpart primary ext4 90% 100%
 
 # Reload partition table
 partprobe "$LOOP_DEV"
@@ -131,6 +133,9 @@ sleep 2
 EFI_PART="${LOOP_DEV}p2"
 BOOT_PART="${LOOP_DEV}p3"
 LVM_PART="${LOOP_DEV}p4"
+VAR_PART="${LOOP_DEV}p5"
+# Partition type GUID of a DPS Variable Data Partition
+DPS_VAR_TYPE=4d21b016-b534-45c2-a9fb-5c16e091fd2d
 
 # Create filesystems on boot partitions
 mkfs.vfat -F32 "$EFI_PART"
@@ -154,18 +159,22 @@ mkfs.ext4 -F /dev/BL/root02
 ROOT_UUID=$(blkid -s UUID -o value /dev/BL/root02)
 BOOT_UUID=$(blkid -s UUID -o value "$BOOT_PART")
 
-# Mount the partitions
-mkdir -p /var/mnt/target
-mount /dev/BL/root02 /var/mnt/target
-mkdir -p /var/mnt/target/boot
-mount "$BOOT_PART" /var/mnt/target/boot
-mkdir -p /var/mnt/target/boot/efi
-mount "$EFI_PART" /var/mnt/target/boot/efi
+# Mount root, /boot and the ESP (but no /var) the way an installer would
+mount_target() {
+    mkdir -p /var/mnt/target
+    mount /dev/BL/root02 /var/mnt/target
+    mkdir -p /var/mnt/target/boot
+    mount "$BOOT_PART" /var/mnt/target/boot
+    mkdir -p /var/mnt/target/boot/efi
+    mount "$EFI_PART" /var/mnt/target/boot/efi
 
-# Create EFI directory structure with some files (simulating existing EFI content)
-mkdir -p /var/mnt/target/boot/efi/EFI/fedora
-touch /var/mnt/target/boot/efi/EFI/fedora/shimx64.efi
-touch /var/mnt/target/boot/efi/EFI/fedora/grubx64.efi
+    # Create EFI directory structure with some files (simulating existing EFI content)
+    mkdir -p /var/mnt/target/boot/efi/EFI/fedora
+    touch /var/mnt/target/boot/efi/EFI/fedora/shimx64.efi
+    touch /var/mnt/target/boot/efi/EFI/fedora/grubx64.efi
+}
+
+mount_target
 
 # Critical: Mount /var as a separate partition
 mkdir -p /var/mnt/target/var
@@ -194,44 +203,53 @@ if [[ $is_composefs != "null" ]]; then
     fi
 fi
 
-# Run bootc install to-filesystem from within the container image under test
-podman run \
-    --rm --privileged \
-    -v /var/mnt/target:/target \
-    -v /dev:/dev \
-    --pid=host \
-    --security-opt label=type:unconfined_t \
-    "$TARGET_IMAGE" \
-    bootc install to-filesystem \
-        "${COMPOSEFS_BACKEND_PARAMS[@]}" \
-        "${KARGS[@]}" \
-        --root-mount-spec=UUID="$ROOT_UUID" \
-        --boot-mount-spec=UUID="$BOOT_UUID" \
-        /target
+run_install() {
+    # Run bootc install to-filesystem from within the container image under test
+    podman run \
+        --rm --privileged \
+        -v /var/mnt/target:/target \
+        -v /dev:/dev \
+        --pid=host \
+        --security-opt label=type:unconfined_t \
+        "$TARGET_IMAGE" \
+        bootc install to-filesystem \
+            "${COMPOSEFS_BACKEND_PARAMS[@]}" \
+            "${KARGS[@]}" \
+            --root-mount-spec=UUID="$ROOT_UUID" \
+            --boot-mount-spec=UUID="$BOOT_UUID" \
+            "$@" \
+            /target
+}
+
+run_install
 
 # Verify the installation succeeded
-echo "Verifying installation..."
+verify_install() {
+    echo "Verifying installation..."
 
-if [[ $is_composefs == "null" ]]; then
-    test -d /var/mnt/target/ostree
-    test -d /var/mnt/target/ostree/repo
+    if [[ $is_composefs == "null" ]]; then
+        test -d /var/mnt/target/ostree
+        test -d /var/mnt/target/ostree/repo
 
-    # Verify bootloader was installed (grub2 or loader for different configurations)
-    test -d /var/mnt/target/boot/grub2 || test -d /var/mnt/target/boot/loader
-else
-    test -d /var/mnt/target/composefs
-
-    # TODO(Johan-Liebert1): This is getting bootloader from the VM, which is not quite correct
-    # It works for now as the CI runs separately for each bootloader, but we need to get the 
-    # bootloader from the installed systemd if we wish to run the tests locally without rebuilding the images
-    # This probably also happens in other tests, one instance is install-outside-container
-    if [[ $bootloader == "grub" ]]; then
+        # Verify bootloader was installed (grub2 or loader for different configurations)
         test -d /var/mnt/target/boot/grub2 || test -d /var/mnt/target/boot/loader
     else
-        test -d /var/mnt/target/boot/efi/EFI
-        test -d /var/mnt/target/boot/efi/loader/entries
+        test -d /var/mnt/target/composefs
+
+        # TODO(Johan-Liebert1): This is getting bootloader from the VM, which is not quite correct
+        # It works for now as the CI runs separately for each bootloader, but we need to get the 
+        # bootloader from the installed systemd if we wish to run the tests locally without rebuilding the images
+        # This probably also happens in other tests, one instance is install-outside-container
+        if [[ $bootloader == "grub" ]]; then
+            test -d /var/mnt/target/boot/grub2 || test -d /var/mnt/target/boot/loader
+        else
+            test -d /var/mnt/target/boot/efi/EFI
+            test -d /var/mnt/target/boot/efi/loader/entries
+        fi
     fi
-fi
+}
+
+verify_install
 
 # Check the volume contents, not just successful deployment. The nested LV
 # must contain its own seed files rather than hide them on the parent LV.
@@ -252,4 +270,93 @@ test ! -e "$child/seed"
 mount /dev/BL/child02 "$child"
 test "$(cat "$child/seed")" = 'child seed'
 
-echo "Installation to-filesystem with separate /var mount succeeded!"
+echo "Caller-mounted /var succeeded; now letting bootc mount /var itself"
+
+# Start over with fresh filesystems and no /var mounted by us
+reset_target() {
+    umount -R /var/mnt/target
+    mkfs.vfat -F32 "$EFI_PART"
+    mkfs.ext4 -F "$BOOT_PART"
+    mkfs.ext4 -F /dev/BL/root02
+    mkfs.ext4 -F /dev/BL/var02
+    mkfs.ext4 -F "$VAR_PART"
+    if [[ $is_composefs != "null" ]]; then
+        tune2fs -O verity /dev/BL/root02
+    fi
+    ROOT_UUID=$(blkid -s UUID -o value /dev/BL/root02)
+    BOOT_UUID=$(blkid -s UUID -o value "$BOOT_PART")
+    mount_target
+}
+
+# Check that a filesystem got the image's /var content, and that the
+# installed system is told to mount it at /var.
+check_var_fs() {
+    local dev=$1 uuid_arg=$2
+    mkdir -p /var/mnt/varcheck
+    mount "$dev" /var/mnt/varcheck
+    test "$(cat /var/mnt/varcheck/lib/bootc-var-test/parent)" = 'parent seed'
+    test "$(cat /var/mnt/varcheck/lib/bootc-var-test/child/seed)" = 'child seed'
+    test "$(stat -c '%u:%g:%a' /var/mnt/varcheck/lib/bootc-var-test/child/seed)" = '1001:1002:640'
+    umount /var/mnt/varcheck
+    # bootc unmounts what it mounted and removes the mountpoint it created.
+    # The mount happened in the container's namespace, so check that the
+    # directory is gone from the filesystem itself.
+    test ! -e /var/mnt/target/var
+    # The mount is recorded for the booted system
+    if [[ $is_composefs == "null" ]]; then
+        grep -rqE "^$uuid_arg /var " /var/mnt/target/ostree/deploy/default/deploy/*/etc/fstab
+    elif [[ $boot_type != "uki" ]]; then
+        grep -rq "systemd.mount-extra=$uuid_arg:/var:" /var/mnt/target/boot
+    fi
+}
+
+# The installed system must not have been told to mount the spare partition
+check_var_part_untouched() {
+    mkdir -p /var/mnt/varcheck
+    mount "$VAR_PART" /var/mnt/varcheck
+    test -z "$(ls -A /var/mnt/varcheck | grep -v '^lost+found$')"
+    umount /var/mnt/varcheck
+    if [[ $is_composefs == "null" ]]; then
+        if grep -qs ' /var ' /var/mnt/target/ostree/deploy/default/deploy/*/etc/fstab; then exit 1; fi
+    fi
+}
+
+echo "Explicit --var-mount-spec"
+reset_target
+VAR_UUID=$(blkid -s UUID -o value /dev/BL/var02)
+if [[ $is_composefs != "null" && $boot_type == "uki" ]]; then
+    # A UKI has a fixed command line, so there is nowhere to record the mount
+    if run_install --var-mount-spec="UUID=$VAR_UUID"; then
+        echo "--var-mount-spec unexpectedly succeeded with a composefs UKI"
+        exit 1
+    fi
+else
+    run_install --var-mount-spec="UUID=$VAR_UUID"
+    verify_install
+    check_var_fs /dev/BL/var02 "UUID=$VAR_UUID"
+fi
+
+echo "Discovery of a DPS Variable Data Partition"
+reset_target
+sfdisk --part-type "$LOOP_DEV" 5 "$DPS_VAR_TYPE"
+partprobe "$LOOP_DEV"
+udevadm settle
+run_install
+verify_install
+if [[ $is_composefs != "null" && $boot_type == "uki" ]]; then
+    # Discovery is skipped (with a warning) when the mount cannot be recorded
+    check_var_part_untouched
+else
+    check_var_fs "$VAR_PART" "PARTUUID=$(blkid -s PARTUUID -o value "$VAR_PART")"
+fi
+
+echo "An empty --var-mount-spec disables discovery"
+reset_target
+run_install --var-mount-spec=
+verify_install
+check_var_part_untouched
+if [[ $is_composefs == "null" ]]; then
+    test "$(cat /var/mnt/target/ostree/deploy/default/var/lib/bootc-var-test/parent)" = 'parent seed'
+fi
+
+echo "Installation to-filesystem with separate /var mount and bootc-mounted /var succeeded!"

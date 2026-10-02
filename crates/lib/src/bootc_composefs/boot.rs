@@ -794,20 +794,23 @@ pub(crate) fn setup_composefs_bls_boot(
                 build_composefs_karg(id.clone(), format_version, allow_missing_fsverity);
             cmdline_options.extend(&Cmdline::from(&composefs_cmdline));
 
-            // If there's a separate /boot partition, add a systemd.mount-extra
+            // If there's a separate /boot or /var, add a systemd.mount-extra
             // karg so systemd mounts it after reboot. This avoids writing to
             // /etc/fstab which conflicts with transient etc (see #1388).
-            if let Some(boot) = root_setup.boot_mount_spec() {
-                if !boot.source.is_empty() {
-                    let mount_extra = format!(
-                        "systemd.mount-extra={}:/boot:{}:{}",
-                        boot.source,
-                        boot.fstype,
-                        boot.options.as_deref().unwrap_or("defaults"),
-                    );
-                    cmdline_options.extend(&Cmdline::from(mount_extra.as_str()));
-                    tracing::debug!("Added /boot mount karg: {mount_extra}");
-                }
+            for mount in [root_setup.boot_mount_spec(), root_setup.var_mount_spec()]
+                .into_iter()
+                .flatten()
+                .filter(|m| !m.source.is_empty())
+            {
+                let mount_extra = format!(
+                    "systemd.mount-extra={}:{}:{}:{}",
+                    mount.source,
+                    mount.target,
+                    mount.fstype,
+                    mount.options.as_deref().unwrap_or("defaults"),
+                );
+                cmdline_options.extend(&Cmdline::from(mount_extra.as_str()));
+                tracing::debug!("Added {} mount karg: {mount_extra}", mount.target);
             }
 
             // Locate ESP partition device by walking up to the root disk(s)
