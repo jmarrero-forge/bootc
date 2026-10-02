@@ -16,6 +16,45 @@ necessary platform partitions (such as the EFI system partition) are
 prepared and mounted by an external tool or script. The root filesystem
 is currently expected to be empty by default.
 
+To use a separate `/var`, pass `--var-mount-spec` (for example
+`UUID=...` or a device path): bootc mounts it at `/var` in the target, initializes
+it as described below, and records it in `/etc/fstab` (or, with the composefs
+backend, a `systemd.mount-extra` kernel argument) for the installed system. If
+a Variable Data Partition (as defined by the Discoverable Partitions
+Specification) exists on the disk backing the root filesystem, it is used by
+default. An empty value disables that discovery and all /var handling,
+keeping the image's `/var` in the root filesystem's state directory.
+With the composefs backend and a UKI, the installed system's kernel command
+line is fixed, so the mount cannot be recorded: an explicit spec is an error
+and discovery is skipped. `--var-mount-spec` is also an error when installing
+to the host root, over an existing ostree system or with `--replace=alongside`.
+
+Tools can tell whether a bootc binary supports this by looking for
+`install-var-mount` in the `Features:` list of `bootc --version`. It covers
+both /var filesystems that bootc mounts (`--var-mount-spec` or a discovered
+Variable Data Partition) and ones the caller mounted; older versions leave
+such filesystems empty, or reject them entirely.
+
+Alternatively, mount filesystems for `/var` or its subdirectories beneath *ROOT_PATH*
+before invoking this command. On a fresh installation, bootc initializes
+empty mounted trees from the image's initial `/var` contents, including
+nested mounts. Empty `lost+found` directories and directories needed to reach
+nested mountpoints do not prevent initialization. Within a tree being
+initialized, mountpoints must resolve to directories in the image, not
+symlinks. A mount for which the image has no content is left empty.
+Filesystems that bootc initializes or leaves empty are SELinux labeled and
+synced. Unlike the root filesystem, they are not remounted read-only.
+When a tree includes nested filesystems, regular files are copied independently
+instead of preserving hardlinks, which cannot span filesystems. Symbolic links,
+ownership, permissions, and extended attributes are preserved.
+
+If a mounted tree or any of its nested mounts already contains data, bootc
+preserves that entire tree without merging image contents into it. Alongside
+installations do not initialize external `/var` filesystems. This does not
+change upgrade semantics: subsequent image updates do not update `/var`.
+The caller remains responsible for configuring `/etc/fstab` or mount units
+so the filesystems are mounted at the same locations on subsequent boots.
+
 # OPTIONS
 
 <!-- BEGIN GENERATED OPTIONS -->
@@ -32,6 +71,10 @@ is currently expected to be empty by default.
 **--boot-mount-spec**=*BOOT_MOUNT_SPEC*
 
     Mount specification for the /boot filesystem
+
+**--var-mount-spec**=*VAR_MOUNT_SPEC*
+
+    Source device specification to mount at /var, such as `UUID=...`, `LABEL=...` or a device path
 
 **--replace**=*REPLACE*
 

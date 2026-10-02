@@ -24,6 +24,13 @@ pub(crate) fn test_bootc_status() -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn test_bootc_version_features() -> Result<()> {
+    let sh = Shell::new()?;
+    let version = cmd!(sh, "bootc --version").read()?;
+    assert!(version.contains("\n - install-var-mount"), "{version}");
+    Ok(())
+}
+
 pub(crate) fn test_bootc_container_inspect() -> Result<()> {
     let sh = Shell::new()?;
     let inspect: serde_json::Value =
@@ -546,6 +553,7 @@ pub(crate) fn run(testargs: libtest_mimic::Arguments) -> Result<()> {
         new_test("install config", test_bootc_install_config),
         new_test("printconfig --all", test_bootc_install_config_all),
         new_test("status", test_bootc_status),
+        new_test("version features", test_bootc_version_features),
         new_test("container inspect", test_bootc_container_inspect),
         new_test("system-reinstall --help", test_system_reinstall_help),
         new_test("container export tar", test_container_export_tar),

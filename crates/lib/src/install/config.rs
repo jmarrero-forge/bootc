@@ -118,6 +118,9 @@ pub(crate) struct InstallConfiguration {
     pub(crate) root_mount_spec: Option<String>,
     /// Mount specification for the /boot filesystem.
     pub(crate) boot_mount_spec: Option<String>,
+    /// Source device specification to mount at /var. An empty string disables
+    /// discovery of a Variable Data Partition and all /var handling.
+    pub(crate) var_mount_spec: Option<String>,
     /// Bootupd configuration
     pub(crate) bootupd: Option<Bootupd>,
     /// Bootloader to use (grub, systemd, none)
@@ -214,6 +217,7 @@ impl Mergeable for InstallConfiguration {
             merge_basic(&mut self.stateroot, other.stateroot, env);
             merge_basic(&mut self.root_mount_spec, other.root_mount_spec, env);
             merge_basic(&mut self.boot_mount_spec, other.boot_mount_spec, env);
+            merge_basic(&mut self.var_mount_spec, other.var_mount_spec, env);
             self.bootupd.merge(other.bootupd, env);
             merge_basic(&mut self.bootloader, other.bootloader, env);
             merge_basic(
@@ -775,12 +779,14 @@ stateroot = "custom"
             r#"[install]
 root-mount-spec = "LABEL=rootfs"
 boot-mount-spec = "UUID=abcd-1234"
+var-mount-spec = "LABEL=var"
 "#,
         )
         .unwrap();
         let install = c.install.unwrap();
         assert_eq!(install.root_mount_spec.unwrap(), "LABEL=rootfs");
         assert_eq!(install.boot_mount_spec.unwrap(), "UUID=abcd-1234");
+        assert_eq!(install.var_mount_spec.unwrap(), "LABEL=var");
     }
 
     #[test]
@@ -791,11 +797,13 @@ boot-mount-spec = "UUID=abcd-1234"
         let mut install: InstallConfiguration = toml::from_str(
             r#"root-mount-spec = "UUID=old"
 boot-mount-spec = "UUID=oldboot"
+var-mount-spec = "UUID=oldvar"
 "#,
         )
         .unwrap();
         let other = InstallConfiguration {
             root_mount_spec: Some("LABEL=newroot".to_string()),
+            var_mount_spec: Some("".to_string()),
             ..Default::default()
         };
         install.merge(other, &env);
@@ -803,6 +811,8 @@ boot-mount-spec = "UUID=oldboot"
         assert_eq!(install.root_mount_spec.as_deref().unwrap(), "LABEL=newroot");
         // boot_mount_spec should remain unchanged
         assert_eq!(install.boot_mount_spec.as_deref().unwrap(), "UUID=oldboot");
+        // An empty var_mount_spec is a value like any other
+        assert_eq!(install.var_mount_spec.as_deref().unwrap(), "");
     }
 
     /// Empty mount specs are valid and signal to omit mount kargs entirely.

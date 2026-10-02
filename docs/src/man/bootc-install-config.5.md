@@ -40,6 +40,10 @@ The `install` section supports these subfields:
 - `boot-mount-spec`: A string specifying the /boot filesystem mount specification.
    If not provided and /boot is a separate mount, its UUID will be used.
    An empty string signals to omit boot mount kargs entirely.
+- `var-mount-spec`: A string specifying the /var filesystem mount specification.
+   If not provided, a Variable Data Partition on the disk backing the root is
+   used, if there is one. An empty value disables that discovery and all /var handling.
+   Only `install to-filesystem` uses it; `install to-disk` ignores it.
 - `discoverable-partitions`: Boolean.  When `true`, root discovery uses the
    Discoverable Partitions Specification via `systemd-gpt-auto-generator` and
    the `root=` kernel argument is omitted.  This requires the bootloader to
