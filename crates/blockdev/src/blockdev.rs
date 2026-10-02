@@ -82,6 +82,9 @@ pub const ESP: &str = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b";
 /// BIOS boot partition type GUID for GPT
 pub const BIOS_BOOT: &str = "21686148-6449-6e6f-744e-656564454649";
 
+/// Variable Data Partition type GUID (DPS), the same on all architectures
+pub const VAR: &str = "4d21b016-b534-45c2-a9fb-5c16e091fd2d";
+
 #[derive(Debug, Deserialize)]
 struct DevicesOutput {
     blockdevices: Vec<Device>,
@@ -228,6 +231,16 @@ impl Device {
             .cloned()
             .collect();
         Ok((!bios_boots.is_empty()).then_some(bios_boots))
+    }
+
+    /// Find the first Variable Data Partition (DPS) among all root devices
+    /// backing this device. Returns None if there is none.
+    pub fn find_colocated_var(&self) -> Result<Option<Device>> {
+        Ok(self
+            .find_all_roots()?
+            .iter()
+            .find_map(|root| root.find_partition_of_type(VAR))
+            .cloned())
     }
 
     /// Find a child partition by partition type (case-insensitive).
@@ -868,6 +881,19 @@ mod test {
         let bios = dev.find_partition_of_bios_boot().unwrap();
         assert_eq!(bios.partn, Some(1));
         assert_eq!(bios.parttype.as_deref().unwrap(), BIOS_BOOT);
+    }
+
+    /// A Variable Data Partition is found by its type GUID, whatever the case.
+    #[test]
+    fn test_find_partition_of_var() {
+        let fixture = include_str!("../tests/fixtures/lsblk.json");
+        let devs: DevicesOutput = serde_json::from_str(fixture).unwrap();
+        let mut dev = devs.blockdevices.into_iter().next().unwrap();
+        assert!(dev.find_partition_of_type(VAR).is_none());
+        let last = dev.children.as_mut().unwrap().last_mut().unwrap();
+        last.parttype = Some(VAR.to_uppercase());
+        let var = dev.find_partition_of_type(VAR).unwrap();
+        assert_eq!(var.partn, Some(3));
     }
 
     /// Verify that without the udev database, partition type fields are null
