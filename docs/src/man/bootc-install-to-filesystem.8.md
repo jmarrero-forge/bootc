@@ -43,29 +43,44 @@ looking for `defer-var` in the `Features:` list of `bootc --version`.
 
 To use separate filesystems for `/var` or its subdirectories, mount them beneath
 *ROOT_PATH* before invoking this command, and pass `--initialize-var-mounts`.
-On a fresh installation, bootc then initializes empty mounted trees from the
-image's initial `/var` contents, including nested mounts. Without that option,
+On a fresh installation, bootc then initializes each empty mounted filesystem
+with its part of the image's `/var`, as it will be mounted at boot: content
+below a nested mount goes to the nested filesystem only. Without that option,
 such filesystems are left alone: the image's initial `/var` contents stay in
 the deployment's state directory, where these mounts hide them at boot.
 `--initialize-var-mounts` is an error over an existing ostree system or with
 `--replace=alongside`.
 
 Empty `lost+found` directories and directories needed to reach nested
-mountpoints do not prevent initialization. Within a tree being initialized,
-mountpoints must resolve to directories in the image, not symlinks. A mount for
-which the image has no content is left empty. Filesystems that bootc
-initializes or leaves empty are synced, and SELinux labeled when SELinux is
-enabled. Unlike the root
-filesystem, they are not remounted read-only. When a tree includes nested
-filesystems, regular files are copied independently instead of preserving
-hardlinks, which cannot span filesystems. Symbolic links, ownership,
-permissions, and extended attributes are preserved.
+mountpoints do not prevent initialization. Mountpoints in or directly below a
+filesystem being initialized must resolve to directories in the image, not
+symlinks. A mount for which the image has no content is left empty.
+Filesystems that bootc initializes or leaves empty are synced, and SELinux
+labeled when SELinux is enabled. Paths the policy labels `<<none>>`, such as
+those below `/var/tmp`, keep the label they were copied with, or get their
+directory's if they have none: on ostree that is the label of the file in the
+deployment checkout, on composefs usually the directory's. Unlike the root filesystem, they are not
+remounted read-only. Symbolic links, ownership, permissions, and extended
+attributes are preserved. Hardlinks are kept within a filesystem where the
+image records them: a composefs image does, while an ostree commit stores
+identical files once and doesn't record hardlinks, so on ostree every file is
+copied on its own, as libostree does when it seeds `/var`. Hardlinks that would
+span filesystems become separate files.
 
-If a mounted tree or any of its nested mounts already contains data, bootc
-preserves that entire tree without merging image contents into it. This does
-not change upgrade semantics: subsequent image updates do not update `/var`.
-The caller remains responsible for configuring `/etc/fstab` or mount units so
-the filesystems are mounted at the same locations on subsequent boots.
+A mounted filesystem that already contains data is left alone, without merging
+image contents into it, and bootc says so. Empty filesystems above or below it
+are still initialized, without the content that belongs to it. If copying into
+a filesystem fails, the installation fails, and that filesystem may be left
+partly filled; if it is no longer empty, bootc will not initialize it again on
+its own. The filesystems initialized before the failure are still labeled and
+synced. A filesystem that is still empty, because the image has nothing for
+it, counts as not initialized: a later run copies the image's empty directory
+again, which resets the owner, mode and SELinux label of its root. Both are
+also logged to the journal when it is available, with
+`MESSAGE_ID=a3dbd7d2ce1341feb6f6003a98eb6657`. This does not change
+upgrade semantics: subsequent image updates do not update `/var`. The caller
+remains responsible for configuring `/etc/fstab` or mount units so the
+filesystems are mounted at the same locations on subsequent boots.
 
 Tools can tell whether a bootc binary supports `--initialize-var-mounts` by
 looking for `initialize-var-mounts` in the `Features:` list of
