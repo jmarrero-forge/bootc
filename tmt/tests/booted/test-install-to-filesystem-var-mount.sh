@@ -1,7 +1,7 @@
 # number: 32
 # tmt:
 #   summary: Test bootc install to-filesystem with separate /var mount
-#   duration: 30m
+#   duration: 45m
 #   require:
 #     - parted
 #     - lvm2
@@ -154,8 +154,8 @@ mkfs.ext4 -F /dev/BL/root02
 ROOT_UUID=$(blkid -s UUID -o value /dev/BL/root02)
 BOOT_UUID=$(blkid -s UUID -o value "$BOOT_PART")
 
-# Mount the partitions, with /var as a separate partition and a nested
-# filesystem below it
+# Mount the partitions, with /var as a separate partition (unless "novar"
+# is passed) and a nested filesystem below it
 mount_target() {
     mkdir -p /var/mnt/target
     mount /dev/BL/root02 /var/mnt/target
@@ -170,7 +170,9 @@ mount_target() {
     touch /var/mnt/target/boot/efi/EFI/fedora/grubx64.efi
 
     mkdir -p /var/mnt/target/var
-    mount /dev/BL/var02 /var/mnt/target/var
+    if [[ ${1:-} != novar ]]; then
+        mount /dev/BL/var02 /var/mnt/target/var
+    fi
     mkdir -p /var/mnt/target/var/lib/bootc-var-test/child
     mount /dev/BL/child02 /var/mnt/target/var/lib/bootc-var-test/child
 }
@@ -260,19 +262,23 @@ test ! -e "$child/seed"
 mount /dev/BL/child02 "$child"
 test "$(cat "$child/seed")" = 'child seed'
 
-echo "Caller-mounted /var is left alone without --initialize-var-mounts"
 # Start over on fresh filesystems, keeping their UUIDs for KARGS
-umount -R /var/mnt/target
-mkfs.vfat -F32 "$EFI_PART"
-mkfs.ext4 -F -U "$BOOT_UUID" "$BOOT_PART"
-mkfs.ext4 -F -U "$ROOT_UUID" /dev/BL/root02
-mkfs.ext4 -F /dev/BL/var02
-mkfs.ext4 -F /dev/BL/child02
-if [[ $is_composefs != "null" ]]; then
-    tune2fs -O verity /dev/BL/var02
-    tune2fs -O verity /dev/BL/root02
-fi
-mount_target
+remount_fresh() {
+    umount -R /var/mnt/target
+    mkfs.vfat -F32 "$EFI_PART"
+    mkfs.ext4 -F -U "$BOOT_UUID" "$BOOT_PART"
+    mkfs.ext4 -F -U "$ROOT_UUID" /dev/BL/root02
+    mkfs.ext4 -F /dev/BL/var02
+    mkfs.ext4 -F /dev/BL/child02
+    if [[ $is_composefs != "null" ]]; then
+        tune2fs -O verity /dev/BL/var02
+        tune2fs -O verity /dev/BL/root02
+    fi
+    mount_target "$@"
+}
+
+echo "Caller-mounted /var is left alone without --initialize-var-mounts"
+remount_fresh
 run_install
 test ! -e /var/mnt/target/var/lib/bootc-var-test/parent
 test ! -e "$child/seed"
@@ -283,5 +289,48 @@ else
     seeded_var=/var/mnt/target/state/os/default/var
 fi
 test "$(cat "$seeded_var/lib/bootc-var-test/parent")" = 'parent seed'
+
+echo "--defer-var with --initialize-var-mounts stores each file once"
+# No /var filesystem this time: the state directory is /var at boot, with
+# the nested filesystem mounted below it.
+remount_fresh novar
+run_install --defer-var --initialize-var-mounts
+test "$(cat "$seeded_var/lib/bootc-var-test/parent")" = 'parent seed'
+test "$(cat "$seeded_var/lib/bootc-var-test/crosslink")" = 'child seed'
+# The nested filesystem's content is only there; the state directory just
+# has its mountpoint.
+test -d "$seeded_var/lib/bootc-var-test/child"
+test -z "$(ls -A "$seeded_var/lib/bootc-var-test/child")"
+test "$(cat "$child/seed")" = 'child seed'
+test "$(stat -c '%u:%g:%a' "$child/seed")" = '1001:1002:640'
+test "$(readlink "$child/symlink")" = seed
+# composefs images record hardlinks, ostree commits don't
+if [[ $is_composefs == "null" ]]; then
+    test "$(stat -c %h "$child/hardlink")" = 1
+    test -f "$seeded_var/.ostree-selabeled"
+else
+    test "$(stat -c %i "$child/seed")" = "$(stat -c %i "$child/hardlink")"
+fi
+if selinuxenabled; then
+    test "$(stat -c '%C' "$seeded_var/lib/bootc-var-test/parent")" = \
+        "$(matchpathcon -n /var/lib/bootc-var-test/parent)"
+    test "$(stat -c '%C' "$child/seed")" = \
+        "$(matchpathcon -n /var/lib/bootc-var-test/child/seed)"
+fi
+
+echo "--defer-var alone leaves /var empty"
+remount_fresh
+run_install --defer-var
+test ! -e "$child/seed"
+test ! -e /var/mnt/target/var/lib/bootc-var-test/parent
+if [[ $is_composefs == "null" ]]; then
+    # Only the stamp that keeps libostree from seeding it
+    test "$(ls -A "$seeded_var")" = .ostree-selabeled
+else
+    test -z "$(ls -A "$seeded_var")"
+fi
+if selinuxenabled; then
+    test "$(stat -c '%C' "$seeded_var")" = "$(matchpathcon -n /var)"
+fi
 
 echo "Installation to-filesystem with separate /var mount succeeded!"
