@@ -29,6 +29,8 @@ cat > /tmp/Containerfile.drop-lbis <<'EOF'
 FROM localhost/bootc as base
 RUN rm -rf /usr/lib/bootc/bound-images.d/*
 RUN mkdir -p /var/lib/bootc-defer-var-test && echo seed > /var/lib/bootc-defer-var-test/seed
+# The policy has no label for /var/tmp/.* (<<none>>)
+RUN mkdir -p /var/tmp/bootc-var-test && echo tmp > /var/tmp/bootc-var-test/file
 RUN mkdir -p /var/lib/bootc-var-test/child && \
     printf 'parent seed\n' > /var/lib/bootc-var-test/parent && \
     printf 'child seed\n' > /var/lib/bootc-var-test/child/seed && \
@@ -155,8 +157,8 @@ mkfs.ext4 -F /dev/BL/root02
 ROOT_UUID=$(blkid -s UUID -o value /dev/BL/root02)
 BOOT_UUID=$(blkid -s UUID -o value "$BOOT_PART")
 
-# Mount the partitions, with /var as a separate partition and a nested
-# filesystem below it
+# Mount the partitions, with /var as a separate partition (unless "novar"
+# is passed) and a nested filesystem below it
 mount_target() {
     mkdir -p /var/mnt/target
     mount /dev/BL/root02 /var/mnt/target
@@ -171,7 +173,9 @@ mount_target() {
     touch /var/mnt/target/boot/efi/EFI/fedora/grubx64.efi
 
     mkdir -p /var/mnt/target/var
-    mount /dev/BL/var02 /var/mnt/target/var
+    if [[ ${1:-} != novar ]]; then
+        mount /dev/BL/var02 /var/mnt/target/var
+    fi
     mkdir -p /var/mnt/target/var/lib/bootc-var-test/child
     mount /dev/BL/child02 /var/mnt/target/var/lib/bootc-var-test/child
 }
@@ -256,6 +260,17 @@ if selinuxenabled; then
         test "$(stat -c '%C' "/var/mnt/target$path")" = "$(matchpathcon -n "$path")"
     done
 fi
+# What the policy has no label for keeps its own, or gets its directory's.
+# The directory gets /var/tmp's on both backends; the file keeps the label
+# of the deployment checkout's file on ostree.
+check_unlabeled_path() {
+    test "$(cat "$1/tmp/bootc-var-test/file")" = tmp
+    if selinuxenabled; then
+        test "$(stat -c '%C' "$1/tmp/bootc-var-test")" = "$(matchpathcon -n /var/tmp)"
+        test "$(stat -c '%C' "$1/tmp/bootc-var-test/file" | cut -d: -f3)" != unlabeled_t
+    fi
+}
+check_unlabeled_path /var/mnt/target/var
 umount "$child"
 test ! -e "$child/seed"
 mount /dev/BL/child02 "$child"
@@ -270,20 +285,28 @@ else
 fi
 test "$(cat "$seeded_var/lib/bootc-defer-var-test/seed")" = seed
 test ! -e "$seeded_var/.bootc-defer-var"
+# A filesystem is mounted on /var: the marker that makes composefs
+# setup-root leave /var to its fstab entry
+test -f "$seeded_var/.bootc-var-mounts"
+test ! -s "$seeded_var/.bootc-var-mounts"
+
+# Start over on fresh filesystems, keeping their UUIDs for KARGS
+remount_fresh() {
+    umount -R /var/mnt/target
+    mkfs.vfat -F32 "$EFI_PART"
+    mkfs.ext4 -F -U "$BOOT_UUID" "$BOOT_PART"
+    mkfs.ext4 -F -U "$ROOT_UUID" /dev/BL/root02
+    mkfs.ext4 -F /dev/BL/var02
+    mkfs.ext4 -F /dev/BL/child02
+    if [[ $is_composefs != "null" ]]; then
+        tune2fs -O verity /dev/BL/var02
+        tune2fs -O verity /dev/BL/root02
+    fi
+    mount_target "$@"
+}
 
 echo "Caller-mounted /var is left alone without --initialize-var-mounts"
-# Start over on fresh filesystems, keeping their UUIDs for KARGS
-umount -R /var/mnt/target
-mkfs.vfat -F32 "$EFI_PART"
-mkfs.ext4 -F -U "$BOOT_UUID" "$BOOT_PART"
-mkfs.ext4 -F -U "$ROOT_UUID" /dev/BL/root02
-mkfs.ext4 -F /dev/BL/var02
-mkfs.ext4 -F /dev/BL/child02
-if [[ $is_composefs != "null" ]]; then
-    tune2fs -O verity /dev/BL/var02
-    tune2fs -O verity /dev/BL/root02
-fi
-mount_target
+remount_fresh
 run_install
 test ! -e /var/mnt/target/var/lib/bootc-var-test/parent
 test ! -e "$child/seed"
@@ -294,19 +317,41 @@ else
     seeded_var=/var/mnt/target/state/os/default/var
 fi
 test "$(cat "$seeded_var/lib/bootc-var-test/parent")" = 'parent seed'
+test ! -e "$seeded_var/.bootc-var-mounts"
 
-echo "--defer-var leaves the state directory unseeded"
-umount -R /var/mnt/target
-mkfs.vfat -F32 "$EFI_PART"
-mkfs.ext4 -F -U "$BOOT_UUID" "$BOOT_PART"
-mkfs.ext4 -F -U "$ROOT_UUID" /dev/BL/root02
-mkfs.ext4 -F /dev/BL/var02
-mkfs.ext4 -F /dev/BL/child02
-if [[ $is_composefs != "null" ]]; then
-    tune2fs -O verity /dev/BL/var02
-    tune2fs -O verity /dev/BL/root02
+echo "--defer-var with --initialize-var-mounts stores each file once"
+# No /var filesystem this time: the state directory is /var at boot, with
+# the nested filesystem mounted below it.
+remount_fresh novar
+run_install --defer-var --initialize-var-mounts
+test "$(cat "$seeded_var/lib/bootc-var-test/parent")" = 'parent seed'
+test "$(cat "$seeded_var/lib/bootc-var-test/crosslink")" = 'child seed'
+test -f "$seeded_var/.bootc-defer-var"
+check_unlabeled_path "$seeded_var"
+# Nothing is mounted on /var itself
+test ! -e "$seeded_var/.bootc-var-mounts"
+# The nested filesystem's content is only there; the state directory just
+# has its mountpoint.
+test -d "$seeded_var/lib/bootc-var-test/child"
+test -z "$(ls -A "$seeded_var/lib/bootc-var-test/child")"
+test "$(cat "$child/seed")" = 'child seed'
+test "$(stat -c '%u:%g:%a' "$child/seed")" = '1001:1002:640'
+test "$(readlink "$child/symlink")" = seed
+# composefs images record hardlinks, ostree commits don't
+if [[ $is_composefs == "null" ]]; then
+    test "$(stat -c %h "$child/hardlink")" = 1
+else
+    test "$(stat -c %i "$child/seed")" = "$(stat -c %i "$child/hardlink")"
 fi
-mount_target
+if selinuxenabled; then
+    test "$(stat -c '%C' "$seeded_var/lib/bootc-var-test/parent")" = \
+        "$(matchpathcon -n /var/lib/bootc-var-test/parent)"
+    test "$(stat -c '%C' "$child/seed")" = \
+        "$(matchpathcon -n /var/lib/bootc-var-test/child/seed)"
+fi
+
+echo "--defer-var alone leaves the state directory unseeded"
+remount_fresh
 run_install --defer-var
 # Only bootc's marker, and on ostree the stamp libostree writes when it
 # labels /var on the first deployment
@@ -319,5 +364,8 @@ test ! -s "$seeded_var/.bootc-defer-var"
 # The separate /var is left alone, as without --defer-var
 test ! -e /var/mnt/target/var/lib/bootc-var-test/parent
 test ! -e "$child/seed"
+if selinuxenabled; then
+    test "$(stat -c '%C' "$seeded_var")" = "$(matchpathcon -n /var)"
+fi
 
 echo "Installation to-filesystem with separate /var mount succeeded!"
