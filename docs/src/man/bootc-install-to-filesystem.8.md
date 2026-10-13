@@ -39,6 +39,12 @@ identical files once and doesn't record hardlinks, so on ostree every file is
 copied on its own, as libostree does when it seeds `/var`. Hardlinks that would
 span filesystems become separate files.
 
+On a booted system, `bootc state initialize-var [PATH]` initializes the empty
+block-device filesystems mounted at or below *PATH* (by default `/var`) from
+the booted image's `/var` the same way, for example a volume added after
+installation. Other mounts there, such as tmpfs, network filesystems, bind
+mounts, btrfs subvolumes or ZFS datasets, are left alone.
+
 A mounted filesystem that already contains data is left alone, without merging
 image contents into it. Empty filesystems above or below it are still
 initialized, without the content that belongs to it. This does not change

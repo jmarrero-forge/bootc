@@ -146,7 +146,7 @@ pub(crate) mod completion;
 pub(crate) mod config;
 mod osbuild;
 pub(crate) mod osconfig;
-mod var_mounts;
+pub(crate) mod var_mounts;
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -226,7 +226,11 @@ pub(crate) const DESTRUCTIVE_CLEANUP: &str = "etc/bootc-destructive-cleanup";
 /// This is an ext4 special directory we need to ignore.
 const LOST_AND_FOUND: &str = "lost+found";
 /// Optional features of this binary, listed by `bootc --version`.
-pub(crate) const FEATURES: &[&str] = &[var_mounts::FEATURE, var_mounts::DEFER_FEATURE];
+pub(crate) const FEATURES: &[&str] = &[
+    var_mounts::FEATURE,
+    var_mounts::DEFER_FEATURE,
+    var_mounts::STATE_FEATURE,
+];
 /// The mount path for selinux
 const SELINUXFS: &str = "/sys/fs/selinux";
 /// The mount path for uefi

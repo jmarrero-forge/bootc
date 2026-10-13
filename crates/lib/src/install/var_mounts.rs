@@ -32,6 +32,9 @@ pub(crate) const FEATURE: &str = "initialize-var-mounts";
 /// Listed by `bootc --version` for `install to-filesystem --defer-var`.
 pub(crate) const DEFER_FEATURE: &str = "defer-var";
 
+/// Listed by `bootc --version` for `bootc state initialize-var`.
+pub(crate) const STATE_FEATURE: &str = "state-initialize-var";
+
 /// libostree fills an empty stateroot var from each new deployment, in
 /// `prepare_deployment_var()` (ostree-sysroot-deploy.c); any entry at all
 /// stops it. To defer /var, we put this one there before the first
@@ -54,28 +57,49 @@ pub(crate) fn target_path(mount: &Utf8Path) -> Utf8PathBuf {
 
 /// Mount paths relative to /var, including the empty path for /var itself.
 pub(crate) fn discover(root: &Utf8Path) -> Result<Vec<Utf8PathBuf>> {
+    discover_matching(root, |_| true)
+}
+
+/// Like [`discover`], but only the filesystems for which `keep` is true.
+fn discover_matching(root: &Utf8Path, keep: fn(&Filesystem) -> bool) -> Result<Vec<Utf8PathBuf>> {
     let root = root
         .canonicalize_utf8()
         .context("Resolving installation root")?;
     let mounts =
         bootc_mount::run_findmnt(&["--submounts", "--mountpoint"], None, Some(root.as_str()))?;
     let mut paths = Vec::new();
-    collect(&root.join(VAR), &mounts.filesystems, &mut paths);
+    collect(&root.join(VAR), &mounts.filesystems, keep, &mut paths);
     paths.sort();
     paths.dedup();
     Ok(paths)
 }
 
-fn collect(var: &Utf8Path, mounts: &[Filesystem], paths: &mut Vec<Utf8PathBuf>) {
+fn collect(
+    var: &Utf8Path,
+    mounts: &[Filesystem],
+    keep: fn(&Filesystem) -> bool,
+    paths: &mut Vec<Utf8PathBuf>,
+) {
     for mount in mounts {
         // An error here only means the mount is outside the target's /var.
         if let Ok(path) = Utf8Path::new(&mount.target).strip_prefix(var) {
-            paths.push(path.to_owned());
+            if keep(mount) {
+                paths.push(path.to_owned());
+            }
         }
         if let Some(children) = &mount.children {
-            collect(var, children, paths);
+            collect(var, children, keep, paths);
         }
     }
+}
+
+/// Whether a filesystem is a block device's filesystem mounted at its root, or /var
+/// itself (on ostree and composefs a bind mount of the state directory). On
+/// a booted system, /var also holds other software's mounts, such as
+/// container tmpfs mounts, network filesystems and bind mounts of host
+/// directories, which aren't ours to fill or label.
+fn is_block_backed(fs: &Filesystem) -> bool {
+    fs.source.starts_with("/dev/") && (!fs.source.contains('[') || fs.target == "/var")
 }
 
 /// The filesystems directly below `parent` among `mounts`: the ones with no
@@ -525,6 +549,54 @@ pub(crate) fn defer_ostree_var(
     Ok(())
 }
 
+/// Implementation of `bootc state initialize-var`: on a booted system, fill
+/// the empty filesystems mounted at or below `scope` in /var from the booted
+/// deployment's image, like `install to-filesystem --initialize-var-mounts`
+/// does at installation.
+pub(crate) async fn initialize_booted(scope: &Utf8Path) -> Result<()> {
+    let resolved = scope
+        .canonicalize_utf8()
+        .with_context(|| format!("Resolving {scope}"))?;
+    let scope = resolved
+        .strip_prefix(Utf8Path::new("/").join(VAR))
+        .map_err(|_| anyhow::anyhow!("{resolved} is not in /var"))?;
+    let storage = crate::cli::get_storage().await?;
+    let mounts: Vec<_> = discover_matching("/".into(), is_block_backed)?
+        .into_iter()
+        .filter(|m| m.starts_with(scope))
+        .collect();
+    if mounts.is_empty() {
+        bail!("No filesystem is mounted at or below {resolved}");
+    }
+    let source = match storage.kind()? {
+        crate::store::BootedStorageKind::Ostree(booted) => {
+            let deployment = booted.sysroot.deployment_dirpath(&booted.deployment);
+            let deployment = storage.physical_root_path.join(deployment.as_str());
+            let deployment_dir = Dir::open_ambient_dir(&deployment, ambient_authority())
+                .with_context(|| format!("Opening {deployment}"))?;
+            // Something mounted there would not be the image's /var.
+            if deployment_dir.is_mountpoint(VAR)? == Some(true) {
+                bail!("{deployment}/{VAR} is a mountpoint");
+            }
+            ImageVar::ostree(&deployment)
+        }
+        crate::store::BootedStorageKind::Composefs(booted) => ImageVar::composefs(
+            &storage.physical_root,
+            &booted.cmdline.digest,
+            booted.cmdline.allow_missing_fsverity,
+        )?,
+    };
+    let root = Dir::open_ambient_dir("/", ambient_authority())?;
+    let prepared = populate(&root, "/".into(), None, &mounts, &source)?;
+    drop(source);
+    if crate::lsm::selinux_enabled() {
+        if let Some(policy) = crate::lsm::new_sepolicy_at(&root)? {
+            label(&root, None, &prepared, &policy)?;
+        }
+    }
+    sync(&root, &prepared.mounts)
+}
+
 /// Flush the filesystems of the given mounts, surfacing writeback errors.
 pub(crate) fn sync(root: &Dir, mounts: &[Utf8PathBuf]) -> Result<()> {
     for mount in mounts {
@@ -880,9 +952,42 @@ mod tests {
         collect(
             "/target with spaces/var".into(),
             &mounts.filesystems,
+            |_| true,
             &mut paths,
         );
         assert_eq!(paths, vec![Utf8PathBuf::from("opt"), "opt/app".into()]);
+        Ok(())
+    }
+
+    #[test]
+    fn collect_block_backed() -> Result<()> {
+        // A booted system's /var: only block-backed filesystems are ours.
+        let mounts: bootc_mount::Findmnt = serde_json::from_value(serde_json::json!({
+            "filesystems": [{
+                "source": "/dev/vda4[/ostree/deploy/default/var]", "target": "/var",
+                "maj:min": "0:1", "fstype": "ext4", "options": "rw", "children": [
+                    {"source": "/dev/mapper/vg_data-app", "target": "/var/opt/app",
+                     "maj:min": "0:2", "fstype": "xfs", "options": "rw"},
+                    {"source": "shm", "target": "/var/lib/containers/storage/overlay-containers/x/userdata/shm",
+                     "maj:min": "0:3", "fstype": "tmpfs", "options": "rw"},
+                    {"source": "sunrpc", "target": "/var/lib/nfs/rpc_pipefs",
+                     "maj:min": "0:4", "fstype": "rpc_pipefs", "options": "rw"},
+                    {"source": "server:/export", "target": "/var/srv/nfs",
+                     "maj:min": "0:5", "fstype": "nfs4", "options": "rw"},
+                    {"source": "/dev/vda4[/ostree/deploy/default/var/lib/kubelet/x]",
+                     "target": "/var/lib/kubelet/pods/p/volume-subpaths/v",
+                     "maj:min": "0:1", "fstype": "ext4", "options": "rw"}
+                ]
+            }]
+        }))?;
+        let mut paths = Vec::new();
+        collect(
+            "/var".into(),
+            &mounts.filesystems,
+            is_block_backed,
+            &mut paths,
+        );
+        assert_eq!(paths, vec![Utf8PathBuf::new(), "opt/app".into()]);
         Ok(())
     }
 
