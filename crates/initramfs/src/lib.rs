@@ -123,6 +123,17 @@ pub struct MountConfig {
     pub transient: bool,
 }
 
+impl MountConfig {
+    /// The mount type this configures, `default` if none.
+    fn mount_type(&self, default: MountType) -> MountType {
+        match self.mount {
+            Some(mt) => mt,
+            None if self.transient => MountType::Transient,
+            None => default,
+        }
+    }
+}
+
 /// The setup-root configuration, see `bootc-setup-root-conf(5)`.
 #[derive(Debug, Deserialize, Default, PartialEq)]
 pub struct Config {
@@ -461,15 +472,7 @@ pub fn mount_subdir(
     config: MountConfig,
     default: MountType,
 ) -> Result<()> {
-    let mount_type = match config.mount {
-        Some(mt) => mt,
-        None => match config.transient {
-            true => MountType::Transient,
-            false => default,
-        },
-    };
-
-    match mount_type {
+    match config.mount_type(default) {
         MountType::None => Ok(()),
         MountType::Bind => Ok(mount_at_wrapper(
             bind_mount(&state, subdir)?,
@@ -516,6 +519,50 @@ pub fn gpt_workaround() -> Result<()> {
         Ok(()) | Err(Errno::EXIST) => Ok(()),
         Err(err) => Err(err).context("Creating /run/systemd/volatile-root"),
     }
+}
+
+/// The fstab, relative to a root or deployment state directory.
+const FSTAB: &str = "etc/fstab";
+/// The fstab in the upper layer of an `[etc] mount = "overlay"` state.
+const OVERLAY_UPPER_FSTAB: &str = "etc/upper/fstab";
+
+/// Read a regular file below `dirfd`, or `None` if there is none, which
+/// includes an overlayfs whiteout or a symlink there.
+fn read_optional(dirfd: impl AsFd, name: &str) -> Result<Option<String>> {
+    use std::io::Read;
+    let fd = match openat(
+        dirfd,
+        name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT | Errno::LOOP | Errno::NXIO | Errno::NODEV) => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("Opening {name}")),
+    };
+    let st = rustix::fs::fstat(&fd).with_context(|| format!("Querying {name}"))?;
+    if rustix::fs::FileType::from_raw_mode(st.st_mode) != rustix::fs::FileType::RegularFile {
+        return Ok(None);
+    }
+    let mut text = String::new();
+    std::fs::File::from(fd)
+        .read_to_string(&mut text)
+        .with_context(|| format!("Reading {name}"))?;
+    Ok(Some(text))
+}
+
+/// Whether an fstab has an entry for /var, like ostree's system generator
+/// checks for in `fstab_has_mount_entry()`.
+fn fstab_mounts_var(fstab: &str) -> bool {
+    fstab
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .any(|target| {
+            let mut parts = target.split('/').filter(|p| !p.is_empty());
+            target.starts_with('/') && parts.next() == Some("var") && parts.next().is_none()
+        })
 }
 
 /// Sets up /sysroot for switch-root
@@ -648,12 +695,43 @@ pub fn setup_root(args: Args) -> Result<()> {
         open_dir(&sysroot, "state/deploy")?,
         composefs_info.digest().to_hex(),
     )?;
+    // When the deployment's fstab mounts a filesystem on /var, leave /var to
+    // systemd like ostree's generator does: binding the state directory's var
+    // over it would make systemd consider /var mounted, and the filesystem
+    // would go unused. An explicit [var] setting wins.
+    let mut config = config;
+    if config.var.mount.is_none() && !config.var.transient {
+        // The fstab that /etc will show: the state's, the overlay's, or the
+        // image's when /etc isn't from the state.
+        let fstab = match config.etc.mount_type(MountType::Bind) {
+            MountType::Bind => read_optional(&state, FSTAB)?,
+            // The state's etc/upper is the upper layer: a file there wins
+            // (read_optional takes a whiteout as absent), else the image's.
+            MountType::Overlay => match rustix::fs::statat(
+                &state,
+                OVERLAY_UPPER_FSTAB,
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            ) {
+                Err(Errno::NOENT) => read_optional(visible_root, FSTAB)?,
+                Err(e) => {
+                    return Err(e).with_context(|| format!("Querying {OVERLAY_UPPER_FSTAB}"));
+                }
+                Ok(_) => read_optional(&state, OVERLAY_UPPER_FSTAB)?,
+            },
+            MountType::None | MountType::Transient => read_optional(visible_root, FSTAB)?,
+        };
+        if fstab.as_deref().is_some_and(fstab_mounts_var) {
+            tracing::debug!("/etc/fstab mounts /var; skipping /var state bind-mount");
+            config.var.mount = Some(MountType::None);
+        }
+    }
     mount_subdir(visible_root, &state, "etc", config.etc, MountType::Bind)?;
     // /var is bind-mounted from the deployment state directory by default.
     // The systemd.volatile=state cmdline detection above (or an explicit
     // [var] mount = "none" in setup-root-conf.toml) can change this to
     // MountType::None, which skips the bind-mount entirely and leaves /var
-    // as an empty directory from the composefs image for systemd to fill.
+    // as an empty directory from the composefs image for systemd to fill,
+    // as does an fstab entry for /var (above).
     mount_subdir(visible_root, &state, "var", config.var, MountType::Bind)?;
 
     if cfg!(not(feature = "pre-6.15")) {
@@ -673,6 +751,45 @@ mod tests {
 
     fn parse(toml: &str) -> Config {
         toml::from_str(toml).expect("TOML parse failed")
+    }
+
+    #[test]
+    fn test_mount_type() {
+        use MountType::{Bind, Overlay, Transient};
+        for (mount, transient, expected) in [
+            (None, false, Bind),
+            (None, true, Transient),
+            (Some(Overlay), true, Overlay),
+            (Some(MountType::None), false, MountType::None),
+        ] {
+            let config = MountConfig { mount, transient };
+            assert_eq!(config.mount_type(Bind), expected, "{config:?}");
+        }
+    }
+
+    #[test]
+    fn test_fstab_mounts_var() {
+        let cases = [
+            ("", false),
+            ("UUID=abc /var ext4 defaults 0 0", true),
+            ("UUID=abc\t/var/\txfs defaults 0 0\n", true),
+            ("  /dev/vg/var //var ext4 defaults", true),
+            ("# UUID=abc /var ext4 defaults 0 0", false),
+            ("UUID=abc /var/log ext4 defaults 0 0", false),
+            ("UUID=abc /variable ext4 defaults 0 0", false),
+            ("UUID=abc var ext4 defaults 0 0", false),
+            (
+                "UUID=r / ext4 defaults 0 0\nUUID=b /boot ext4 defaults 0 0",
+                false,
+            ),
+            (
+                "UUID=r / ext4 defaults 0 0\nUUID=v /var ext4 defaults 0 0",
+                true,
+            ),
+        ];
+        for (fstab, expected) in cases {
+            assert_eq!(fstab_mounts_var(fstab), expected, "{fstab:?}");
+        }
     }
 
     #[test]

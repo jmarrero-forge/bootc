@@ -960,5 +960,6 @@ pub(crate) fn install_create_rootfs(
         boot,
         kargs,
         skip_finalize: false,
+        defer_var: false,
     })
 }

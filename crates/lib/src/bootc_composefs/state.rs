@@ -231,6 +231,7 @@ pub(crate) fn update_boot_digest_in_origin(
 /// * `boot_digest`       - Optional boot digest for verification
 /// * `manifest_digest`   - OCI manifest content digest, stored in the origin file so the
 ///                         manifest+config can be retrieved from the composefs repo later
+/// * `defer_var`         - Leave the shared `/var` empty on an initial installation
 ///
 /// # State Directory Structure
 ///
@@ -250,6 +251,7 @@ pub(crate) async fn write_composefs_state(
     boot_digest: String,
     manifest_digest: &str,
     allow_missing_fsverity: bool,
+    defer_var: bool,
 ) -> Result<()> {
     let state_path = root_path
         .join(STATE_DIR_RELATIVE)
@@ -271,7 +273,7 @@ pub(crate) async fn write_composefs_state(
         &root_path,
         &deployment_id.to_hex(),
         &state_path,
-        staged.is_none(),
+        staged.is_none() && !defer_var,
         allow_missing_fsverity,
     )?;
 
