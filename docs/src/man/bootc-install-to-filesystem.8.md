@@ -46,8 +46,21 @@ upgrade semantics: subsequent image updates do not update `/var`. The caller
 remains responsible for configuring `/etc/fstab` or mount units so the
 filesystems are mounted at the same locations on subsequent boots.
 
-Tools can tell whether a bootc binary supports `--initialize-var-mounts` by
-looking for `initialize-var-mounts` in the `Features:` list of
+With `--defer-var`, the deployment's state directory for `/var`
+(`ostree/deploy/STATEROOT/var`, or `state/os/default/var` with composefs) is not
+seeded from the image. Combined with `--initialize-var-mounts`, bootc instead
+copies the image's `/var` into `/var` as it will be at boot: the state
+directory gets what is not on a mounted filesystem, and each empty mounted
+filesystem gets its part, so nothing is stored twice. With a filesystem
+mounted on `/var` itself, the state directory stays empty. Without
+`--initialize-var-mounts`, the installed system starts with an empty `/var`.
+On ostree, bootc puts libostree's `.ostree-selabeled` stamp into the empty
+state directory before deploying: libostree seeds it only while it is
+empty, on this and on later deployments. `--defer-var` is an error over an
+existing ostree system or with `--replace=alongside`.
+
+Tools can tell whether a bootc binary supports these options by looking for
+`initialize-var-mounts` and `defer-var` in the `Features:` list of
 `bootc --version`.
 
 # OPTIONS
@@ -70,6 +83,10 @@ looking for `initialize-var-mounts` in the `Features:` list of
 **--initialize-var-mounts**
 
     Initialize empty filesystems mounted at or below /var in the target from the image's /var, including nested mounts
+
+**--defer-var**
+
+    Do not seed the deployment's state directory with the image's /var
 
 **--replace**=*REPLACE*
 

@@ -1,6 +1,7 @@
 //! Initialize caller-mounted /var filesystems from the image's /var.
 
 use std::ffi::CString;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
@@ -10,7 +11,10 @@ use bootc_mount::tempmount::TempMount;
 use bootc_utils::CommandRunExt;
 use camino::{Utf8Path, Utf8PathBuf};
 use cap_std_ext::{
-    cap_std::{ambient_authority, fs::Dir},
+    cap_std::{
+        ambient_authority,
+        fs::{Dir, Permissions, PermissionsExt as _},
+    },
     dirext::CapStdExtDirExt,
 };
 use ostree_ext::ostree;
@@ -24,6 +28,18 @@ use super::LOST_AND_FOUND;
 /// `install to-filesystem` know they can pass `--initialize-var-mounts`.
 /// Older versions leave /var filesystems empty, or reject them entirely.
 pub(crate) const FEATURE: &str = "initialize-var-mounts";
+
+/// Listed by `bootc --version` for `install to-filesystem --defer-var`.
+pub(crate) const DEFER_FEATURE: &str = "defer-var";
+
+/// libostree fills an empty stateroot var from each new deployment, in
+/// `prepare_deployment_var()` (ostree-sysroot-deploy.c); any entry at all
+/// stops it. To defer /var, we put this one there before the first
+/// deployment. It is libostree's own stamp for having labeled /var, which
+/// `selinux_relabel_var_if_needed()` writes there on the first deployment
+/// anyway, so a deferred /var looks like any other. It also keeps libostree
+/// from relabeling the (empty) /var; bootc labels what it fills itself.
+pub(crate) const OSTREE_VAR_STAMP: &str = ".ostree-selabeled";
 
 const VAR: &str = "var";
 
@@ -80,7 +96,8 @@ fn children<'a>(parent: &Utf8Path, mounts: &'a [Utf8PathBuf]) -> Vec<&'a Utf8Pat
 /// Whether the filesystem mounted at `root` (relative to /var) holds no
 /// state yet. `dir` is its directory at `path`. A fresh filesystem may
 /// contain an empty lost+found, and directories leading to the mountpoints
-/// of the filesystems nested in it; their content is their own.
+/// of the filesystems nested in it; their content is their own. /var itself
+/// may contain the stamp that keeps libostree from seeding it.
 fn is_empty_fs(
     dir: &Dir,
     root: &Utf8Path,
@@ -94,7 +111,15 @@ fn is_empty_fs(
         let Some(name) = name.to_str() else {
             return Ok(false);
         };
-        if !entry.file_type().with_context(context)?.is_dir() {
+        let file_type = entry.file_type().with_context(context)?;
+        if name == OSTREE_VAR_STAMP
+            && root.as_str().is_empty()
+            && path == root
+            && file_type.is_file()
+        {
+            continue;
+        }
+        if !file_type.is_dir() {
             return Ok(false);
         }
         let child = path.join(name);
@@ -287,23 +312,90 @@ impl CopyView {
     }
 }
 
-/// Fill each empty filesystem among `mounts` (relative to /var, below
-/// `root_path`) with its part of the image's /var, one `cp` per filesystem.
-/// Hardlinks within one filesystem are kept where the source has them;
-/// those spanning filesystems become separate files. Filesystems that
-/// already hold data are left alone, but empty filesystems below and above
-/// them are still filled.
-///
-/// Returns the filesystems that were initialized, or left empty because the
-/// image has no content for them. These still need labeling and syncing.
+/// Give the directory `dst` the ownership, mode, extended attributes (such as
+/// ACLs, but not the SELinux label) and timestamps of `src`, as `cp -a` would.
+fn copy_dir_metadata(src: &Utf8Path, dst: &Utf8Path) -> Result<()> {
+    use rustix::fs::{AtFlags, Timespec, Timestamps, XattrFlags};
+    let context = || format!("Copying the metadata of {src} to {dst}");
+    let meta = src.symlink_metadata().with_context(context)?;
+    std::os::unix::fs::lchown(dst, Some(meta.uid()), Some(meta.gid())).with_context(context)?;
+    std::fs::set_permissions(dst, std::fs::Permissions::from_mode(meta.mode() & 0o7777))
+        .with_context(context)?;
+    let mut names =
+        vec![0u8; rustix::fs::llistxattr(src.as_str(), &mut [0u8; 0][..]).with_context(context)?];
+    let len = rustix::fs::llistxattr(src.as_str(), &mut names[..]).with_context(context)?;
+    names.truncate(len);
+    // Like cp -a, skip what can't be set. The SELinux label is set when the
+    // stateroot var is relabeled afterwards anyway.
+    for name in names
+        .split(|b| *b == 0)
+        .filter(|n| !n.is_empty() && *n != b"security.selinux")
+    {
+        let name = CString::new(name)?;
+        let mut value = vec![
+            0u8;
+            rustix::fs::lgetxattr(src.as_str(), &name, &mut [0u8; 0][..])
+                .with_context(context)?
+        ];
+        let len =
+            rustix::fs::lgetxattr(src.as_str(), &name, &mut value[..]).with_context(context)?;
+        match rustix::fs::lsetxattr(dst.as_str(), &name, &value[..len], XattrFlags::empty()) {
+            Ok(()) => {}
+            Err(e @ (rustix::io::Errno::NOTSUP | rustix::io::Errno::PERM)) => {
+                tracing::debug!("Not copying {name:?} to {dst}: {e}");
+            }
+            Err(e) => return Err(e).with_context(context),
+        }
+    }
+    let time = |sec, nsec| Timespec {
+        tv_sec: sec,
+        tv_nsec: nsec as _,
+    };
+    let times = Timestamps {
+        last_access: time(meta.atime(), meta.atime_nsec()),
+        last_modification: time(meta.mtime(), meta.mtime_nsec()),
+    };
+    rustix::fs::utimensat(
+        rustix::fs::CWD,
+        dst.as_str(),
+        &times,
+        AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .with_context(context)?;
+    Ok(())
+}
+
+/// What [`populate`] initialized, or left empty because the image has no
+/// content for it. These still need labeling and syncing.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Prepared {
+    /// The stateroot's var, which is /var at boot unless a filesystem is
+    /// mounted there.
+    pub(crate) stateroot_var: bool,
+    /// Mounts, relative to /var.
+    pub(crate) mounts: Vec<Utf8PathBuf>,
+}
+
+/// Fill each empty filesystem of /var as it will be at boot with its part of
+/// the image's /var, one `cp` per filesystem: the filesystems in `mounts`
+/// (relative to /var, below `root_path`), and the `stateroot_var` (relative
+/// to `root_path`) unless one is mounted on /var. The stateroot var is
+/// normally seeded by the deployment backend already, and empty only with
+/// `--defer-var`. Content below a mountpoint goes only to the filesystem
+/// mounted there, so each file is stored once. Hardlinks within one
+/// filesystem are kept where the source has them; those spanning filesystems
+/// become separate files. Filesystems that already hold data are left alone,
+/// but empty filesystems below and above them are still filled.
 pub(crate) fn populate(
     root: &Dir,
     root_path: &Utf8Path,
+    stateroot_var: Option<&Utf8Path>,
     mounts: &[Utf8PathBuf],
     source: &ImageVar,
-) -> Result<Vec<Utf8PathBuf>> {
-    let mut prepared = Vec::new();
-    if mounts.is_empty() {
+) -> Result<Prepared> {
+    let mut prepared = Prepared::default();
+    let stateroot_var = stateroot_var.filter(|_| !mounts.iter().any(|m| m.as_str().is_empty()));
+    if mounts.is_empty() && stateroot_var.is_none() {
         return Ok(prepared);
     }
     let root_path = root_path
@@ -311,6 +403,32 @@ pub(crate) fn populate(
         .with_context(|| format!("Resolving {root_path}"))?;
     let source_dir = Dir::open_ambient_dir(&source.path, ambient_authority())
         .with_context(|| format!("Opening {}", source.path))?;
+    if let Some(var) = stateroot_var {
+        let nested = children("".into(), mounts);
+        let dir = root
+            .open_dir(var)
+            .with_context(|| format!("Opening /{var}"))?;
+        if is_empty_fs(&dir, "".into(), "".into(), &nested)? {
+            // The mountpoints are not mounted here: they get an empty
+            // directory, like the image's, and no content.
+            let mut view = CopyView::default();
+            for m in nested {
+                if check_source_path(&source_dir, m)? {
+                    view.hide_source.push(source.path.join(m));
+                }
+            }
+            println!("Initializing /var from the image");
+            let target = root_path.join(var);
+            view.copy(&source.path, &target, source.hardlinks)
+                .context("Initializing /var")?;
+            // cp gave them the metadata of what hid the image's directories
+            for hidden in &view.hide_source {
+                let path = hidden.strip_prefix(&source.path)?;
+                copy_dir_metadata(hidden, &target.join(path))?;
+            }
+            prepared.stateroot_var = true;
+        }
+    }
     for mount in mounts {
         let target = target_path(mount);
         let nested = children(mount, mounts);
@@ -323,7 +441,7 @@ pub(crate) fn populate(
         }
         if !check_source_path(&source_dir, mount)? {
             println!("No initial content for /{target} in the image");
-            prepared.push(mount.clone());
+            prepared.mounts.push(mount.clone());
             continue;
         }
         let mut view = CopyView::default();
@@ -340,15 +458,35 @@ pub(crate) fn populate(
             source.hardlinks,
         )
         .with_context(|| format!("Initializing /{target}"))?;
-        prepared.push(mount.clone());
+        prepared.mounts.push(mount.clone());
     }
     Ok(prepared)
 }
 
-/// SELinux label the filesystems that [`populate`] prepared, by their
-/// paths at boot.
-pub(crate) fn label(root: &Dir, mounts: &[Utf8PathBuf], policy: &ostree::SePolicy) -> Result<()> {
-    for mount in mounts {
+/// SELinux label what [`populate`] prepared, by its paths at boot.
+pub(crate) fn label(
+    root: &Dir,
+    stateroot_var: Option<&Utf8Path>,
+    prepared: &Prepared,
+    policy: &ostree::SePolicy,
+) -> Result<()> {
+    match stateroot_var {
+        // Like libostree does when it seeds /var.
+        Some(var) if prepared.stateroot_var => {
+            crate::lsm::relabel_recurse(root, var, Some("/var".into()), policy)
+                .context("SELinux labeling of /var")?
+        }
+        // Even when nothing was copied there: on a deferred ostree install
+        // libostree's stamp keeps it from labeling the directory as /var,
+        // and the walk of the physical root labels it by its own path.
+        Some(var) => {
+            let meta = root.symlink_metadata(var)?;
+            crate::lsm::relabel(root, &meta, var, Some("/var".into()), policy)
+                .context("SELinux labeling of /var")?
+        }
+        None => {}
+    }
+    for mount in &prepared.mounts {
         let mut path = target_path(mount);
         // These are fresh filesystems; label their roots unconditionally.
         // Without selinuxfs (e.g. in an osbuild buildroot), an inode without
@@ -362,6 +500,27 @@ pub(crate) fn label(root: &Dir, mounts: &[Utf8PathBuf], policy: &ostree::SePolic
         }
         crate::lsm::ensure_dir_labeled_recurse(root, &mut path, policy, None)
             .with_context(|| format!("SELinux labeling of /{path}"))?;
+    }
+    Ok(())
+}
+
+/// Keep libostree from seeding the empty `stateroot_var` on deployments;
+/// see [`OSTREE_VAR_STAMP`].
+pub(crate) fn defer_ostree_var(
+    stateroot_var: &Dir,
+    policy: Option<&ostree::SePolicy>,
+) -> Result<()> {
+    stateroot_var
+        .atomic_write_with_perms(OSTREE_VAR_STAMP, b"", Permissions::from_mode(0o644))
+        .with_context(|| format!("Writing {OSTREE_VAR_STAMP}"))?;
+    if let Some(policy) = policy {
+        let path = Utf8Path::new("/var").join(OSTREE_VAR_STAMP);
+        let label = crate::lsm::require_label(policy, &path, libc::S_IFREG | 0o644)?;
+        crate::lsm::set_security_selinux_path(
+            stateroot_var,
+            OSTREE_VAR_STAMP.into(),
+            label.as_bytes(),
+        )?;
     }
     Ok(())
 }
@@ -440,6 +599,15 @@ mod tests {
             (&["lib/", "lib/lost+found/"], &["", "lib/app"], false),
             (&["lib/", "tmp/"], &["", "lib/app"], false),
             (&["lib/", "lib/state"], &["", "lib/app"], false),
+            // The stamp libostree leaves, at the root only
+            (&[".ostree-selabeled"], &[""], true),
+            (&[".ostree-selabeled/"], &[""], false),
+            (
+                &["lib/", "lib/app/", "lib/app/.ostree-selabeled"],
+                &["", "lib/app"],
+                true,
+            ),
+            (&["lib/", "lib/.ostree-selabeled"], &["", "lib/app"], false),
         ];
         for (entries, mounts, expected) in cases {
             let root = TempDir::new(ambient_authority())?;
@@ -496,7 +664,9 @@ mod tests {
         }
 
         fn populate(&self, mounts: &[Utf8PathBuf]) -> Result<Vec<Utf8PathBuf>> {
-            populate(&self.dir, &self.path, mounts, &self.image())
+            let prepared = populate(&self.dir, &self.path, None, mounts, &self.image())?;
+            assert!(!prepared.stateroot_var);
+            Ok(prepared.mounts)
         }
     }
 
@@ -586,6 +756,60 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_stateroot_var() -> Result<()> {
+        // (stateroot var entries, mounts, whether the stateroot var is filled)
+        let cases: &[(&[&str], &[&str], bool)] = &[
+            // Seeded by the backend
+            (&["opt/"], &[], false),
+            // Deferred
+            (&[], &[], true),
+            (&[".ostree-selabeled"], &[], true),
+            (&[".ostree-selabeled"], &["srv"], true),
+            // Hidden at boot by a /var filesystem
+            (&[".ostree-selabeled"], &[""], false),
+        ];
+        for (entries, mounts, filled) in cases {
+            let root = image_root()?;
+            root.create_dir_all("state/var")?;
+            for entry in *entries {
+                let entry = Utf8Path::new("state/var").join(entry);
+                match entry.as_str().strip_suffix('/') {
+                    Some(dir) => root.create_dir_all(dir)?,
+                    None => root.write(&entry, "")?,
+                }
+            }
+            let mounts = paths(mounts);
+            for m in &mounts {
+                root.create_dir_all(target_path(m))?;
+            }
+            let prepared = populate(
+                &root,
+                &root.path,
+                Some("state/var".into()),
+                &mounts,
+                &root.image(),
+            )?;
+            assert_eq!(prepared.stateroot_var, *filled, "{entries:?} {mounts:?}");
+            assert_eq!(
+                root.try_exists("state/var/opt/app/seed")?,
+                *filled,
+                "{entries:?} {mounts:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ostree_stamp() -> Result<()> {
+        let root = TempDir::new(ambient_authority())?;
+        defer_ostree_var(&root, None)?;
+        let meta = root.metadata(OSTREE_VAR_STAMP)?;
+        assert_eq!((meta.len(), meta.mode() & 0o777), (0, 0o644));
+        assert!(is_empty_fs(&root, "".into(), "".into(), &[])?);
         Ok(())
     }
 
@@ -683,6 +907,12 @@ mod tests {
             root.write("image/var/opt/app/seed", "seed")?;
             root.set_permissions("image/var/opt/app/seed", Permissions::from_mode(0o640))?;
             root.set_permissions("image/var/opt/app", Permissions::from_mode(0o750))?;
+            rustix::fs::lsetxattr(
+                path.join("image/var/opt/app").as_str(),
+                c"user.test",
+                b"image",
+                rustix::fs::XattrFlags::empty(),
+            )?;
             root.hard_link("image/var/opt/app/seed", &root, "image/var/parent-link")?;
             root.hard_link(
                 "image/var/opt/app/seed",
@@ -709,7 +939,7 @@ mod tests {
             let mounts = discover(path)?;
             assert_eq!(mounts, paths(&["", "opt/app", "opt/app/data"]));
             assert_eq!(
-                populate(&root, path, &mounts, &image)?,
+                populate(&root, path, None, &mounts, &image)?.mounts,
                 paths(&["", "opt/app"])
             );
             for file in [
@@ -750,11 +980,37 @@ mod tests {
             root.write("var/opt/app/seed", "existing state")?;
             let mounts = discover(path)?;
             assert_eq!(
-                populate(&root, path, &mounts, &image)?,
+                populate(&root, path, None, &mounts, &image)?.mounts,
                 paths(&["opt/app/data"])
             );
             assert_eq!(root.read_to_string("var/opt/app/seed")?, "existing state");
             assert_eq!(root.read_to_string("var/opt/app/data/db")?, "image db");
+
+            // No /var filesystem: a deferred stateroot var gets everything
+            // but what the nested filesystems hold, which goes only there.
+            bootc_mount::unmount_recursive(&path.join("var"))?;
+            root.create_dir_all("var/opt/app")?;
+            tmpfs("var/opt/app")?;
+            root.create_dir_all("state/var")?;
+            defer_ostree_var(&root.open_dir("state/var")?, None)?;
+            let mounts = discover(path)?;
+            assert_eq!(mounts, paths(&["opt/app"]));
+            let prepared = populate(&root, path, Some("state/var".into()), &mounts, &image)?;
+            assert!(prepared.stateroot_var);
+            assert_eq!(prepared.mounts, mounts);
+            assert_eq!(root.read_to_string("state/var/opt/top")?, "top");
+            assert_eq!(root.read_to_string("state/var/parent-link")?, "seed");
+            assert_eq!(root.read_to_string("var/opt/app/seed")?, "seed");
+            // Only the mountpoint, like the image's
+            assert_eq!(root.read_dir("state/var/opt/app")?.count(), 0);
+            assert_eq!(root.metadata("state/var/opt/app")?.mode() & 0o777, 0o750);
+            let mut value = [0u8; 16];
+            let len = rustix::fs::lgetxattr(
+                path.join("state/var/opt/app").as_str(),
+                c"user.test",
+                &mut value[..],
+            )?;
+            assert_eq!(&value[..len], b"image");
             Ok(())
         })();
         let unmount = bootc_mount::unmount_recursive(path);
