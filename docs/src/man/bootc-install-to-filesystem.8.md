@@ -32,6 +32,11 @@ first-boot state: on composefs it is already visible in the initramfs, before
 the SELinux policy is loaded, and directories created there then (such as
 `/var/lib`, for `/var/lib/nfs/rpc_pipefs`) are unlabeled, which can keep a
 mount below them from working.
+On composefs, the file also tells setup-root that `/var` is the caller's: when
+the deployment's `/etc/fstab` has a mount entry for `/var`, it doesn't
+bind-mount the state directory over it (see **bootc-setup-root-conf**(5)).
+Switching or rolling back to an image whose initramfs predates this hides that
+`/var` behind the empty state directory.
 `--defer-var` is an error over an existing ostree system or with
 `--replace=alongside`. Tools can tell whether a bootc binary supports it by
 looking for `defer-var` in the `Features:` list of `bootc --version`.

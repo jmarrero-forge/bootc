@@ -16,8 +16,9 @@ pub(crate) const FEATURE: &str = "defer-var";
 /// it. bootc's composefs deployment checks for it. libostree seeds the
 /// stateroot var on every deployment, but only while it is empty
 /// (`prepare_deployment_var()`), so on ostree the marker's presence is
-/// enough. It stays there afterwards, as a record that /var was deferred.
-pub(crate) const MARKER: &str = ".bootc-defer-var";
+/// enough. It stays there afterwards: on composefs, setup-root leaves a
+/// /var that the fstab mounts to systemd only on a system with the marker.
+pub(crate) const MARKER: &str = bootc_initramfs_setup::DEFER_VAR_MARKER;
 
 /// Mark the stateroot var at `var` (relative to `root`, created if needed)
 /// as deferred, before the first deployment. With a `policy`, the directory
