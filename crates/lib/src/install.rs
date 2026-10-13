@@ -2296,6 +2296,8 @@ async fn install_to_filesystem_impl(
         }
     }
 
+    // The image's /var, to initialize the caller's /var filesystems from
+    let mut image_var = None;
     if state.composefs_options.composefs_backend {
         let fetch_ref = state.source.composefs_fetch_reference();
         let (manifest, _) = get_container_manifest_and_config(&fetch_ref).await?;
@@ -2362,6 +2364,17 @@ async fn install_to_filesystem_impl(
             )?;
         }
         setup_composefs_boot(rootfs, state, &pull_result, allow_missing_verity).await?;
+        if !var_mounts.is_empty() {
+            let deployments = rootfs
+                .physical_root
+                .open_dir(crate::composefs_consts::STATE_DIR_RELATIVE)?;
+            let id = var_mounts::only_dir(&deployments).context("Finding the deployment")?;
+            image_var = Some(var_mounts::ImageVar::composefs(
+                &rootfs.physical_root,
+                &id,
+                allow_missing_verity,
+            )?);
+        }
 
         // Label composefs objects as /usr so they get usr_t rather than
         // default_t (which has no policy match).
@@ -2377,6 +2390,14 @@ async fn install_to_filesystem_impl(
         }
     } else {
         ostree_install(state, rootfs, cleanup).await?;
+        if !var_mounts.is_empty() {
+            let deployments = format!("ostree/deploy/{}/deploy", state.stateroot());
+            let deployment = var_mounts::only_dir(&rootfs.physical_root.open_dir(&deployments)?)
+                .context("Finding the deployment")?;
+            image_var = Some(var_mounts::ImageVar::ostree(
+                &rootfs.physical_root_path.join(deployments).join(deployment),
+            ));
+        }
 
         // For s390x, we set zipl as the bootloader
         // this needs to be done after the ostree commit is deployed,
@@ -2398,52 +2419,45 @@ async fn install_to_filesystem_impl(
     }
 
     // The deployment backend seeds its own state directory, not the caller's
-    // mounted /var tree. Populate fresh external filesystems while all nested
-    // mounts are still visible, before labeling and finalizing the installation.
-    let prepared_var_mounts = if !var_mounts.is_empty() {
-        let source = if state.composefs_options.composefs_backend {
-            Utf8PathBuf::from(crate::composefs_consts::SHARED_VAR_PATH)
-        } else {
-            Utf8PathBuf::from(format!("ostree/deploy/{}/var", state.stateroot()))
-        };
-        var_mounts::populate(&rootfs.physical_root, &source, var_mounts)?
-    } else {
-        Vec::new()
+    // mounted /var tree. Populate fresh external filesystems from the image
+    // while all nested mounts are still visible, before labeling and
+    // finalizing the installation.
+    let policy = state.load_policy()?;
+    let mut prepared_var_mounts = Vec::new();
+    let populated = match image_var {
+        Some(image_var) => var_mounts::populate(
+            &rootfs.physical_root,
+            &rootfs.physical_root_path,
+            var_mounts,
+            &image_var,
+            &mut prepared_var_mounts,
+        ),
+        None => Ok(()),
     };
+    // Label each newly prepared filesystem by its deployed /var path (the
+    // physical-root walk below skips mountpoints), and flush them, surfacing
+    // any writeback errors, before anything else can fail. Unlike root and
+    // boot they are not remounted read-only or frozen: they may be bind
+    // mounts or lack freeze support, and callers may add content. Then
+    // report a failed copy.
+    var_mounts::finish(
+        &rootfs.physical_root,
+        &prepared_var_mounts,
+        policy.as_ref(),
+        populated,
+    )?;
 
     // As the very last step before filesystem finalization, do a full SELinux
     // relabel of the physical root filesystem.  Any files that are already
     // labeled (e.g. ostree deployment contents, composefs objects) are skipped.
-    if let Some(policy) = state.load_policy()? {
+    if let Some(policy) = &policy {
         tracing::info!("Performing final SELinux relabeling of physical root");
         let mut path = Utf8PathBuf::from("");
-        crate::lsm::ensure_dir_labeled_recurse(&rootfs.physical_root, &mut path, &policy, None)
+        crate::lsm::ensure_dir_labeled_recurse(&rootfs.physical_root, &mut path, policy, None)
             .context("Final SELinux relabeling of physical root")?;
-        // The physical-root walk skips mountpoints. Label each newly
-        // prepared filesystem separately, using its deployed /var path.
-        for mount in &prepared_var_mounts {
-            let mut path = var_mounts::target_path(mount);
-            // These are fresh filesystems; label their roots unconditionally.
-            // Without selinuxfs (e.g. in an osbuild buildroot), an inode without
-            // a label still reports the kernel's unlabeled context, which the
-            // walk below would take as labeled.
-            for p in [path.clone(), path.join(LOST_AND_FOUND)] {
-                if let Some(meta) = rootfs.physical_root.symlink_metadata_optional(&p)? {
-                    crate::lsm::relabel(&rootfs.physical_root, &meta, &p, None, &policy)
-                        .with_context(|| format!("SELinux labeling of /{p}"))?;
-                }
-            }
-            crate::lsm::ensure_dir_labeled_recurse(&rootfs.physical_root, &mut path, &policy, None)
-                .with_context(|| format!("SELinux labeling of /{path}"))?;
-        }
     } else {
         tracing::debug!("Skipping final SELinux relabel (SELinux is disabled)");
     }
-
-    // Flush the /var filesystems we wrote, surfacing any writeback errors.
-    // Unlike root and boot they are not remounted read-only or frozen: they
-    // may be bind mounts or lack freeze support, and callers may add content.
-    var_mounts::sync(&rootfs.physical_root, &prepared_var_mounts)?;
 
     // Finalize mounted filesystems
     if !rootfs.skip_finalize {
