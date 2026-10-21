@@ -1,7 +1,7 @@
 # number: 32
 # tmt:
 #   summary: Test bootc install to-filesystem with separate /var mount
-#   duration: 30m
+#   duration: 45m
 #   require:
 #     - parted
 #     - lvm2
@@ -28,6 +28,14 @@ bootc image copy-to-storage
 cat > /tmp/Containerfile.drop-lbis <<'EOF'
 FROM localhost/bootc as base
 RUN rm -rf /usr/lib/bootc/bound-images.d/*
+RUN mkdir -p /var/lib/bootc-var-test/child && \
+    printf 'parent seed\n' > /var/lib/bootc-var-test/parent && \
+    printf 'child seed\n' > /var/lib/bootc-var-test/child/seed && \
+    chmod 0640 /var/lib/bootc-var-test/child/seed && \
+    chown 1001:1002 /var/lib/bootc-var-test/child/seed && \
+    ln /var/lib/bootc-var-test/child/seed /var/lib/bootc-var-test/crosslink && \
+    ln /var/lib/bootc-var-test/child/seed /var/lib/bootc-var-test/child/hardlink && \
+    ln -s seed /var/lib/bootc-var-test/child/symlink
 EOF
 
 is_composefs=$(bootc status --json | jq '.status.booted.composefs')
@@ -134,32 +142,42 @@ vgcreate BL "$LVM_PART"
 
 # Create logical volumes
 lvcreate -L 4G -n var02 BL
+lvcreate -L 256M -n child02 BL
 lvcreate -l 100%FREE -n root02 BL
 
 # Create filesystems on logical volumes
 mkfs.ext4 -F /dev/BL/var02
+mkfs.ext4 -F /dev/BL/child02
 mkfs.ext4 -F /dev/BL/root02
 
 # Get UUIDs for bootc install
 ROOT_UUID=$(blkid -s UUID -o value /dev/BL/root02)
-BOOT_UUID=$(blkid -s UUID -o value "$EFI_PART")
+BOOT_UUID=$(blkid -s UUID -o value "$BOOT_PART")
 
-# Mount the partitions
-mkdir -p /var/mnt/target
-mount /dev/BL/root02 /var/mnt/target
-mkdir -p /var/mnt/target/boot
-mount "$BOOT_PART" /var/mnt/target/boot
-mkdir -p /var/mnt/target/boot/efi
-mount "$EFI_PART" /var/mnt/target/boot/efi
+# Mount the partitions, with /var as a separate partition (unless "novar"
+# is passed) and a nested filesystem below it
+mount_target() {
+    mkdir -p /var/mnt/target
+    mount /dev/BL/root02 /var/mnt/target
+    mkdir -p /var/mnt/target/boot
+    mount "$BOOT_PART" /var/mnt/target/boot
+    mkdir -p /var/mnt/target/boot/efi
+    mount "$EFI_PART" /var/mnt/target/boot/efi
 
-# Create EFI directory structure with some files (simulating existing EFI content)
-mkdir -p /var/mnt/target/boot/efi/EFI/fedora
-touch /var/mnt/target/boot/efi/EFI/fedora/shimx64.efi
-touch /var/mnt/target/boot/efi/EFI/fedora/grubx64.efi
+    # Create EFI directory structure with some files (simulating existing EFI content)
+    mkdir -p /var/mnt/target/boot/efi/EFI/fedora
+    touch /var/mnt/target/boot/efi/EFI/fedora/shimx64.efi
+    touch /var/mnt/target/boot/efi/EFI/fedora/grubx64.efi
 
-# Critical: Mount /var as a separate partition
-mkdir -p /var/mnt/target/var
-mount /dev/BL/var02 /var/mnt/target/var
+    mkdir -p /var/mnt/target/var
+    if [[ ${1:-} != novar ]]; then
+        mount /dev/BL/var02 /var/mnt/target/var
+    fi
+    mkdir -p /var/mnt/target/var/lib/bootc-var-test/child
+    mount /dev/BL/child02 /var/mnt/target/var/lib/bootc-var-test/child
+}
+
+mount_target
 
 echo "Filesystem layout:"
 mount | grep /var/mnt/target || true
@@ -181,21 +199,25 @@ if [[ $is_composefs != "null" ]]; then
     fi
 fi
 
-# Run bootc install to-filesystem from within the container image under test
-podman run \
-    --rm --privileged \
-    -v /var/mnt/target:/target \
-    -v /dev:/dev \
-    --pid=host \
-    --security-opt label=type:unconfined_t \
-    "$TARGET_IMAGE" \
-    bootc install to-filesystem \
-        --disable-selinux \
-        "${COMPOSEFS_BACKEND_PARAMS[@]}" \
-        "${KARGS[@]}" \
-        --root-mount-spec=UUID="$ROOT_UUID" \
-        --boot-mount-spec=UUID="$BOOT_UUID" \
-        /target
+run_install() {
+    # Run bootc install to-filesystem from within the container image under test
+    podman run \
+        --rm --privileged \
+        -v /var/mnt/target:/target \
+        -v /dev:/dev \
+        --pid=host \
+        --security-opt label=type:unconfined_t \
+        "$TARGET_IMAGE" \
+        bootc install to-filesystem \
+            "${COMPOSEFS_BACKEND_PARAMS[@]}" \
+            "${KARGS[@]}" \
+            --root-mount-spec=UUID="$ROOT_UUID" \
+            --boot-mount-spec=UUID="$BOOT_UUID" \
+            "$@" \
+            /target
+}
+
+run_install --initialize-var-mounts
 
 # Verify the installation succeeded
 echo "Verifying installation..."
@@ -221,5 +243,94 @@ else
     fi
 fi
 
+# Check the volume contents, not just successful deployment. The nested LV
+# must contain its own seed files rather than hide them on the parent LV.
+test "$(cat /var/mnt/target/var/lib/bootc-var-test/parent)" = 'parent seed'
+child=/var/mnt/target/var/lib/bootc-var-test/child
+test "$(cat "$child/seed")" = 'child seed'
+test "$(stat -c '%u:%g:%a' "$child/seed")" = '1001:1002:640'
+test "$(readlink "$child/symlink")" = seed
+test "$(cat "$child/hardlink")" = 'child seed'
+test "$(cat /var/mnt/target/var/lib/bootc-var-test/crosslink)" = 'child seed'
+if selinuxenabled; then
+    for path in /var /var/lib/bootc-var-test/child /var/lib/bootc-var-test/child/seed; do
+        test "$(stat -c '%C' "/var/mnt/target$path")" = "$(matchpathcon -n "$path")"
+    done
+fi
+umount "$child"
+test ! -e "$child/seed"
+mount /dev/BL/child02 "$child"
+test "$(cat "$child/seed")" = 'child seed'
+
+# Start over on fresh filesystems, keeping their UUIDs for KARGS
+remount_fresh() {
+    umount -R /var/mnt/target
+    mkfs.vfat -F32 "$EFI_PART"
+    mkfs.ext4 -F -U "$BOOT_UUID" "$BOOT_PART"
+    mkfs.ext4 -F -U "$ROOT_UUID" /dev/BL/root02
+    mkfs.ext4 -F /dev/BL/var02
+    mkfs.ext4 -F /dev/BL/child02
+    if [[ $is_composefs != "null" ]]; then
+        tune2fs -O verity /dev/BL/var02
+        tune2fs -O verity /dev/BL/root02
+    fi
+    mount_target "$@"
+}
+
+echo "Caller-mounted /var is left alone without --initialize-var-mounts"
+remount_fresh
+run_install
+test ! -e /var/mnt/target/var/lib/bootc-var-test/parent
+test ! -e "$child/seed"
+# The image's /var stays in the backend's state directory instead
+if [[ $is_composefs == "null" ]]; then
+    seeded_var=/var/mnt/target/ostree/deploy/default/var
+else
+    seeded_var=/var/mnt/target/state/os/default/var
+fi
+test "$(cat "$seeded_var/lib/bootc-var-test/parent")" = 'parent seed'
+
+echo "--defer-var with --initialize-var-mounts stores each file once"
+# No /var filesystem this time: the state directory is /var at boot, with
+# the nested filesystem mounted below it.
+remount_fresh novar
+run_install --defer-var --initialize-var-mounts
+test "$(cat "$seeded_var/lib/bootc-var-test/parent")" = 'parent seed'
+test "$(cat "$seeded_var/lib/bootc-var-test/crosslink")" = 'child seed'
+# The nested filesystem's content is only there; the state directory just
+# has its mountpoint.
+test -d "$seeded_var/lib/bootc-var-test/child"
+test -z "$(ls -A "$seeded_var/lib/bootc-var-test/child")"
+test "$(cat "$child/seed")" = 'child seed'
+test "$(stat -c '%u:%g:%a' "$child/seed")" = '1001:1002:640'
+test "$(readlink "$child/symlink")" = seed
+# composefs images record hardlinks, ostree commits don't
+if [[ $is_composefs == "null" ]]; then
+    test "$(stat -c %h "$child/hardlink")" = 1
+    test -f "$seeded_var/.ostree-selabeled"
+else
+    test "$(stat -c %i "$child/seed")" = "$(stat -c %i "$child/hardlink")"
+fi
+if selinuxenabled; then
+    test "$(stat -c '%C' "$seeded_var/lib/bootc-var-test/parent")" = \
+        "$(matchpathcon -n /var/lib/bootc-var-test/parent)"
+    test "$(stat -c '%C' "$child/seed")" = \
+        "$(matchpathcon -n /var/lib/bootc-var-test/child/seed)"
+fi
+
+echo "--defer-var alone leaves /var empty"
+remount_fresh
+run_install --defer-var
+test ! -e "$child/seed"
+test ! -e /var/mnt/target/var/lib/bootc-var-test/parent
+if [[ $is_composefs == "null" ]]; then
+    # Only the stamp that keeps libostree from seeding it
+    test "$(ls -A "$seeded_var")" = .ostree-selabeled
+else
+    test -z "$(ls -A "$seeded_var")"
+fi
+if selinuxenabled; then
+    test "$(stat -c '%C' "$seeded_var")" = "$(matchpathcon -n /var)"
+fi
 
 echo "Installation to-filesystem with separate /var mount succeeded!"

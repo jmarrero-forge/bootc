@@ -16,6 +16,59 @@ necessary platform partitions (such as the EFI system partition) are
 prepared and mounted by an external tool or script. The root filesystem
 is currently expected to be empty by default.
 
+To use separate filesystems for `/var` or its subdirectories, mount them beneath
+*ROOT_PATH* before invoking this command, and pass `--initialize-var-mounts`.
+On a fresh installation, bootc then initializes each empty mounted filesystem
+with its part of the image's `/var`, as it will be mounted at boot: content
+below a nested mount goes to the nested filesystem only. Without that option,
+such filesystems are left alone: the image's initial `/var` contents stay in
+the deployment's state directory, where these mounts hide them at boot.
+`--initialize-var-mounts` is an error over an existing ostree system or with
+`--replace=alongside`.
+
+Empty `lost+found` directories and directories needed to reach nested
+mountpoints do not prevent initialization. Mountpoints in or directly below a
+filesystem being initialized must resolve to directories in the image, not
+symlinks. A mount for which the image has no content is left empty.
+Filesystems that bootc initializes or leaves empty are synced, and SELinux
+labeled when SELinux is enabled. Unlike the root filesystem, they are not
+remounted read-only. Symbolic links, ownership, permissions, and extended
+attributes are preserved. Hardlinks are kept within a filesystem where the
+image records them: a composefs image does, while an ostree commit stores
+identical files once and doesn't record hardlinks, so on ostree every file is
+copied on its own, as libostree does when it seeds `/var`. Hardlinks that would
+span filesystems become separate files.
+
+On a booted system, `bootc state initialize-var [PATH]` initializes the empty
+block-device filesystems mounted at or below *PATH* (by default `/var`) from
+the booted image's `/var` the same way, for example a volume added after
+installation. Other mounts there, such as tmpfs, network filesystems, bind
+mounts, btrfs subvolumes or ZFS datasets, are left alone.
+
+A mounted filesystem that already contains data is left alone, without merging
+image contents into it. Empty filesystems above or below it are still
+initialized, without the content that belongs to it. This does not change
+upgrade semantics: subsequent image updates do not update `/var`. The caller
+remains responsible for configuring `/etc/fstab` or mount units so the
+filesystems are mounted at the same locations on subsequent boots.
+
+With `--defer-var`, the deployment's state directory for `/var`
+(`ostree/deploy/STATEROOT/var`, or `state/os/default/var` with composefs) is not
+seeded from the image. Combined with `--initialize-var-mounts`, bootc instead
+copies the image's `/var` into `/var` as it will be at boot: the state
+directory gets what is not on a mounted filesystem, and each empty mounted
+filesystem gets its part, so nothing is stored twice. With a filesystem
+mounted on `/var` itself, the state directory stays empty. Without
+`--initialize-var-mounts`, the installed system starts with an empty `/var`.
+On ostree, bootc puts libostree's `.ostree-selabeled` stamp into the empty
+state directory before deploying: libostree seeds it only while it is
+empty, on this and on later deployments. `--defer-var` is an error over an
+existing ostree system or with `--replace=alongside`.
+
+Tools can tell whether a bootc binary supports these options by looking for
+`initialize-var-mounts` and `defer-var` in the `Features:` list of
+`bootc --version`.
+
 # OPTIONS
 
 <!-- BEGIN GENERATED OPTIONS -->
@@ -32,6 +85,14 @@ is currently expected to be empty by default.
 **--boot-mount-spec**=*BOOT_MOUNT_SPEC*
 
     Mount specification for the /boot filesystem
+
+**--initialize-var-mounts**
+
+    Initialize empty filesystems mounted at or below /var in the target from the image's /var, including nested mounts
+
+**--defer-var**
+
+    Do not seed the deployment's state directory with the image's /var
 
 **--replace**=*REPLACE*
 

@@ -386,6 +386,7 @@ pub(crate) async fn do_upgrade(
         boot_digest,
         &manifest_digest,
         booted_cfs.cmdline.allow_missing_fsverity,
+        false,
     )
     .await?;
 
