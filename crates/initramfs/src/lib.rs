@@ -139,6 +139,16 @@ pub struct Config {
 /// Default path to the setup-root configuration file, relative to the booted root.
 pub const SETUP_ROOT_CONF_PATH: &str = "/usr/lib/composefs/setup-root-conf.toml";
 
+/// Kernel argument naming a composefs image with the kernel modules, which is
+/// mounted on [`MODULES_DIR`] so that the modules stay outside the digest of
+/// the root filesystem.
+///
+/// Experimental, see <https://github.com/bootc-dev/bootc/issues/2584>.
+pub const KARG_KMODS: &str = "bootc.kmods";
+
+/// Where the kernel modules image is mounted, relative to the root.
+pub const MODULES_DIR: &str = "usr/lib/modules";
+
 /// Returns `true` if the configuration at `path` requests a transient `/etc`
 /// overlay.  Used by the systemd generator to decide whether to emit the
 /// SELinux relabel unit *before* those mounts exist (the generator runs before
@@ -410,6 +420,25 @@ fn parse_composefs_candidates(cmdline: &str) -> Result<Vec<ComposefsCmdline<Sha5
     Ok(candidates)
 }
 
+/// Parse the digest of the kernel modules image ([`KARG_KMODS`]) from the
+/// kernel command line, if there is one.
+pub fn parse_kmods_digest(cmdline: &str) -> Result<Option<Sha512HashValue>> {
+    let mut found = None;
+    for parameter in Cmdline::from(cmdline).iter() {
+        if &*parameter.key() != KARG_KMODS {
+            continue;
+        }
+        anyhow::ensure!(found.is_none(), "duplicate {KARG_KMODS}= kernel argument");
+        let value = parameter
+            .value()
+            .ok_or_else(|| anyhow::anyhow!("{KARG_KMODS}= kernel argument has no value"))?;
+        let digest = Sha512HashValue::from_hex(value)
+            .with_context(|| format!("Parsing {KARG_KMODS}={value}"))?;
+        found = Some(digest);
+    }
+    Ok(found)
+}
+
 fn select_composefs_candidate<T>(
     candidates: &[ComposefsCmdline<Sha512HashValue>],
     mut mount: impl FnMut(&ComposefsCmdline<Sha512HashValue>) -> Result<Option<T>>,
@@ -563,6 +592,7 @@ pub fn setup_root(args: Args) -> Result<()> {
     if candidates.is_empty() {
         anyhow::bail!("No composefs image in cmdline");
     }
+    let kmods = parse_kmods_digest(&cmdline).context("Failed to parse kernel modules cmdline")?;
     let allow_missing_fsverity = candidates[0].is_insecure();
     if candidates
         .iter()
@@ -635,6 +665,16 @@ pub fn setup_root(args: Args) -> Result<()> {
     let visible_root: &dyn AsFd = transient_overlay_fd
         .as_ref()
         .map_or(&new_root as &dyn AsFd, |fd| fd as &dyn AsFd);
+
+    // Kernel modules shipped as their own composefs image, outside the digest
+    // of the root filesystem. Like the root, the image is found by the digest
+    // that the (signed) UKI cmdline pins, so it is verified the same way.
+    if let Some(kmods) = kmods {
+        let kmods = kmods.to_hex();
+        let kmods_fs = mount_composefs_image(&sysroot, &kmods, allow_missing_fsverity)
+            .with_context(|| format!("Mounting kernel modules image {kmods}"))?;
+        mount_at_wrapper(kmods_fs, visible_root, MODULES_DIR)?;
+    }
 
     // Mount the physical sysroot (with the composefs repo) into the new root
     // so that `bootc status` and other tools can find it after switch-root.
@@ -764,6 +804,28 @@ mod tests {
         })
         .unwrap();
         assert_eq!(selected, v1_digest.to_hex());
+    }
+
+    #[test]
+    fn test_parse_kmods_digest() {
+        let digest = Sha512HashValue::from_hex("ab".repeat(64)).unwrap();
+        let karg = format!("{KARG_KMODS}={}", digest.to_hex());
+        let ok_cases = [
+            ("quiet rw".to_string(), None),
+            (karg.clone(), Some(digest.clone())),
+            (format!("quiet {karg} rw"), Some(digest.clone())),
+        ];
+        for (cmdline, expected) in ok_cases {
+            assert_eq!(parse_kmods_digest(&cmdline).unwrap(), expected, "{cmdline}");
+        }
+        let err_cases = [
+            KARG_KMODS.to_string(),
+            format!("{KARG_KMODS}=nothex"),
+            format!("{karg} {karg}"),
+        ];
+        for cmdline in err_cases {
+            assert!(parse_kmods_digest(&cmdline).is_err(), "{cmdline}");
+        }
     }
 
     #[test]

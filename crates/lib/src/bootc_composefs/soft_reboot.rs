@@ -1,13 +1,15 @@
 use crate::{
     bootc_composefs::{
+        boot::BootType,
         service::start_finalize_stated_svc,
         status::{build_composefs_karg, get_composefs_status},
+        utils::get_uki_cmdline,
     },
     cli::SoftRebootMode,
     store::{BootedComposefs, Storage},
 };
 use anyhow::{Context, Result};
-use bootc_initramfs_setup::setup_root;
+use bootc_initramfs_setup::{KARG_KMODS, parse_kmods_digest, setup_root};
 use bootc_mount::{PID1, bind_mount_from_pidns};
 use camino::Utf8Path;
 use cap_std_ext::cap_std::ambient_authority;
@@ -59,6 +61,20 @@ pub(crate) fn reset_soft_reboot() -> Result<()> {
     println!("Cleared soft reboot queued state");
 
     Ok(())
+}
+
+/// The cmdline that `setup_root` gets for the soft-reboot target: its
+/// composefs karg, plus the kernel modules image that the target's own cmdline
+/// pins, if any, so that its /usr/lib/modules is mounted as on a normal boot.
+fn soft_reboot_cmdline(composefs_karg: String, target_cmdline: Option<&str>) -> Result<String> {
+    let kmods = target_cmdline
+        .map(parse_kmods_digest)
+        .transpose()?
+        .flatten();
+    Ok(match kmods {
+        Some(kmods) => format!("{composefs_karg} {KARG_KMODS}={}", kmods.to_hex()),
+        None => composefs_karg,
+    })
 }
 
 /// Checks if the provided deployment is soft reboot capable, and soft reboots the system if
@@ -116,11 +132,16 @@ pub(crate) async fn prepare_soft_reboot_composefs(
     // the karg's self-description, not whether the soft-reboot actually
     // succeeds: `setup_root` (below) resolves the deployment purely from the
     // digest, independent of the composefs=/composefs.digest= tag.
-    let cmdline = build_composefs_karg(
+    let composefs_karg = build_composefs_karg(
         deployment_digest,
         booted_cfs.repo.erofs_version(),
         booted_cfs.cmdline.allow_missing_fsverity,
     );
+    let target_cmdline = match required_deployment.deployment.boot_type {
+        BootType::Uki => Some(get_uki_cmdline(storage, deployment_id)?),
+        BootType::Bls => None,
+    };
+    let cmdline = soft_reboot_cmdline(composefs_karg, target_cmdline.as_deref())?;
 
     let args = bootc_initramfs_setup::Args {
         cmd: vec![],
@@ -142,4 +163,33 @@ pub(crate) async fn prepare_soft_reboot_composefs(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_soft_reboot_cmdline() {
+        let karg = "composefs=abc".to_string();
+        let digest = "cd".repeat(64);
+        let cases = [
+            (None, "composefs=abc".to_string()),
+            (
+                Some("rw quiet composefs=abc".to_string()),
+                "composefs=abc".to_string(),
+            ),
+            (
+                Some(format!("rw {KARG_KMODS}={digest} composefs=abc")),
+                format!("composefs=abc {KARG_KMODS}={digest}"),
+            ),
+        ];
+        for (target, expected) in cases {
+            assert_eq!(
+                soft_reboot_cmdline(karg.clone(), target.as_deref()).unwrap(),
+                expected
+            );
+        }
+        assert!(soft_reboot_cmdline(karg, Some(&format!("{KARG_KMODS}=bad"))).is_err());
+    }
 }
