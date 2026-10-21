@@ -115,6 +115,25 @@ pub(crate) async fn compute_composefs_digest(
     Ok(digest)
 }
 
+/// Computes the digest of the kernel modules image of the filesystem at
+/// `path` (see [`super::kmods`]), or `None` if it ships no such image.
+#[fn_error_context::context("Computing kernel modules digest")]
+pub(crate) async fn compute_kmods_digest(
+    path: &Utf8Path,
+    erofs_version: FormatVersion,
+) -> Result<Option<Sha512HashValue>> {
+    // Avoid reading the whole tree for the common case
+    if !path.join(super::kmods::KMODS_PAYLOAD_DIR).try_exists()? {
+        return Ok(None);
+    }
+    let (_td_guard, repo) = new_temp_composefs_repo(erofs_version)?;
+    let (dirfd, fs) = read_root(path, &repo).await?;
+    let kmods = super::kmods::kmods_filesystem(&fs, |fs| {
+        composefs_boot::selabel::selabel_from_dir(fs, &dirfd).map(drop)
+    })?;
+    Ok(kmods.map(|kmods| kmods.compute_image_id(erofs_version)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
