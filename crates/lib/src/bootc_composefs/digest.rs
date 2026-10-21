@@ -11,7 +11,7 @@ use cap_std_ext::cap_std;
 use cap_std_ext::cap_std::fs::Dir;
 use composefs::dumpfile;
 use composefs::erofs::format::FormatVersion;
-use composefs::fsverity::FsVerityHashValue;
+use composefs::fsverity::{FsVerityHashValue, Sha512HashValue};
 use composefs::repository::RepositoryConfig;
 use composefs_boot::BootOps as _;
 use composefs_ctl::composefs;
@@ -46,6 +46,34 @@ pub(crate) fn new_temp_composefs_repo(
     Ok((td_guard, Arc::new(repo)))
 }
 
+/// Read the filesystem at `path` with the same transformations as when the
+/// image's layers are read on the target, returning it along with a
+/// directory fd for `path`.
+async fn read_root(
+    path: &Utf8Path,
+    repo: &Arc<ComposefsRepository>,
+) -> Result<(OwnedFd, composefs::tree::FileSystem<Sha512HashValue>)> {
+    if path.as_str() == "/" {
+        anyhow::bail!("Cannot operate on active root filesystem; mount separate target instead");
+    }
+
+    let dirfd: OwnedFd = rustix::fs::open(
+        path.as_std_path(),
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .with_context(|| format!("Opening {path}"))?;
+    let fs = composefs::fs::read_container_root(
+        dirfd.try_clone()?,
+        std::path::PathBuf::from("."),
+        Some(repo.clone()),
+        &composefs::generic_tree::OciTransformOptions::default(),
+    )
+    .await
+    .context("Reading container root")?;
+    Ok((dirfd, fs))
+}
+
 /// Computes the bootable composefs digest for a filesystem at the given path.
 ///
 /// This reads the filesystem from the specified path, transforms it for boot,
@@ -69,27 +97,10 @@ pub(crate) async fn compute_composefs_digest(
     erofs_version: FormatVersion,
     write_dumpfile_to: Option<&Utf8Path>,
 ) -> Result<String> {
-    if path.as_str() == "/" {
-        anyhow::bail!("Cannot operate on active root filesystem; mount separate target instead");
-    }
-
     let (_td_guard, repo) = new_temp_composefs_repo(erofs_version)?;
 
     // Read filesystem from path, transform for boot, compute digest
-    let dirfd: OwnedFd = rustix::fs::open(
-        path.as_std_path(),
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::empty(),
-    )
-    .with_context(|| format!("Opening {path}"))?;
-    let mut fs = composefs::fs::read_container_root(
-        dirfd,
-        std::path::PathBuf::from("."),
-        Some(repo.clone()),
-        &composefs::generic_tree::OciTransformOptions::default(),
-    )
-    .await
-    .context("Reading container root")?;
+    let (_dirfd, mut fs) = read_root(path, &repo).await?;
     fs.transform_for_boot(&repo).context("Preparing for boot")?;
     let id = fs.compute_image_id(erofs_version);
     let digest = id.to_hex();
