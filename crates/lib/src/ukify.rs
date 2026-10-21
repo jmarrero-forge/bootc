@@ -8,6 +8,7 @@ use std::ffi::OsString;
 use std::process::Command;
 
 use anyhow::{Context, Result};
+use bootc_initramfs_setup::KARG_KMODS;
 use bootc_utils::CommandRunExt;
 use camino::Utf8Path;
 use cap_std_ext::cap_std::fs::Dir;
@@ -18,7 +19,8 @@ use composefs::erofs::format::FormatVersion;
 use composefs::fsverity::{FsVerityHashValue, Sha512HashValue};
 use composefs_ctl::composefs;
 
-use crate::bootc_composefs::digest::compute_composefs_digest;
+use crate::bootc_composefs::digest::{compute_composefs_digest, compute_kmods_digest};
+use crate::bootc_composefs::kmods::KMODS_PAYLOAD_DIR;
 use crate::bootc_composefs::status::build_composefs_karg;
 use crate::cli::ErofsVersionArg;
 use crate::kernel::KernelInternal;
@@ -54,9 +56,11 @@ fn composefs_kargs_for_uki(
 /// 1. Verifies that ukify is available
 /// 2. Finds the kernel in the rootfs
 /// 3. Computes the composefs digest
-/// 4. Reads kernel arguments from kargs.d
-/// 5. Appends any additional kargs provided via --karg
-/// 6. Invokes ukify with computed arguments plus any pass-through args
+/// 4. Computes the digest of the kernel modules image, if the rootfs ships
+///    one in `/boot/bootc/modules` (see [`crate::bootc_composefs::kmods`])
+/// 5. Reads kernel arguments from kargs.d
+/// 6. Appends any additional kargs provided via --karg
+/// 7. Invokes ukify with computed arguments plus any pass-through args
 #[context("Building UKI")]
 pub(crate) async fn build_ukify(
     rootfs: &Utf8Path,
@@ -142,6 +146,19 @@ pub(crate) async fn build_ukify(
         None
     };
 
+    // Kernel modules shipped outside the root filesystem get their own digest
+    let kmods_digest = compute_kmods_digest(rootfs, erofs_version).await?;
+    if kmods_digest.is_some() {
+        let kver = &kernel_final.kernel.version;
+        let kver_dir = format!("{KMODS_PAYLOAD_DIR}/{kver}");
+        if !root
+            .try_exists(&kver_dir)
+            .context("Checking kernel modules")?
+        {
+            anyhow::bail!("/{KMODS_PAYLOAD_DIR} has no modules for kernel {kver}");
+        }
+    }
+
     // Get kernel arguments from kargs.d
     let mut cmdline = crate::bootc_kargs::get_kargs_in_root(&root, std::env::consts::ARCH)?;
 
@@ -155,6 +172,11 @@ pub(crate) async fn build_ukify(
         allow_missing_fsverity,
     ) {
         cmdline.extend(&Cmdline::from(karg));
+    }
+
+    if let Some(digest) = kmods_digest {
+        tracing::info!("Kernel modules digest: {}", digest.to_hex());
+        cmdline.extend(&Cmdline::from(format!("{KARG_KMODS}={}", digest.to_hex())));
     }
 
     // Add any extra kargs provided via --karg

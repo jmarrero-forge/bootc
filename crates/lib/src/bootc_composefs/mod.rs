@@ -6,6 +6,7 @@ pub(crate) mod export;
 pub(crate) mod finalize;
 pub(crate) mod gc;
 pub(crate) mod image;
+pub(crate) mod kmods;
 pub(crate) mod progress;
 pub(crate) mod repo;
 pub(crate) mod rollback;
