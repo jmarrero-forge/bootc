@@ -84,6 +84,10 @@ fn compute_apply_kargs_diff(
 /// This allows bootc to maintain user customizations while applying changes from
 /// updated container images.
 ///
+/// The result becomes the kernel arguments of a composefs Type 1 (BLS) entry,
+/// so a kernel modules pin in it is refused: only a UKI may carry one (see
+/// [`crate::bootc_composefs::kmods::ensure_no_kmods_pin`]).
+///
 /// # Arguments
 /// * `new_fs`       - Directory handle to the new filesystem containing kargs.d files
 /// * `current_root` - Optional directory handle to current root filesystem
@@ -102,7 +106,11 @@ pub(crate) fn compute_new_kargs(
 
     compute_apply_kargs_diff(&existing_kargs, &remote_kargs, new_kargs);
 
-    Ok(())
+    crate::bootc_composefs::kmods::ensure_no_kmods_pin(
+        new_kargs,
+        "the kernel arguments of the Type 1 (BLS) boot entry (from kargs.d, --karg, \
+         or on upgrade the booted entry's own options)",
+    )
 }
 
 /// Load and parse all bootc kargs.d files in the specified root, returning

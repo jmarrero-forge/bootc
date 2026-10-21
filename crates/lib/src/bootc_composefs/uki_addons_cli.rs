@@ -1,4 +1,4 @@
-use std::io::{Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -30,6 +30,94 @@ use crate::{
     cli::{UkiAddonCliOpts, UkiAddonScope},
     store::{BootedComposefs, Storage},
 };
+
+/// Refuse to add an addon whose cmdline has a composefs= or
+/// composefs.digest=, or a kernel modules pin: only the UKI itself may carry
+/// those.
+fn validate_addon_cmdline<R: Read + Seek>(addon: &mut R, addon_name: &str) -> Result<()> {
+    // UKI Addon might not even have a cmdline
+    let cmdline_str = match uki::get_cmdline_buffered(&mut *addon) {
+        Ok(cmdline) => cmdline,
+        // This is fine, no cmdline section so it's just a no op
+        Err(uki::UkiError::MissingSection(..)) => return Ok(()),
+        Err(e) => return Err(e).context("Getting UKI cmdline"),
+    };
+
+    let cfs_cmdline_info = ComposefsBootCmdline::<Sha512HashValue>::from_cmdline(&cmdline_str)
+        .context("Parsing composefs=")?;
+    if let Some(cfs_cmdline) = cfs_cmdline_info {
+        anyhow::bail!(
+            "composefs cmdline {cfs_cmdline:?} found in UKI Addon {addon_name}. Refusing to add"
+        );
+    }
+
+    crate::bootc_composefs::kmods::ensure_no_kmods_pin(
+        &cmdline_str,
+        &format!("UKI Addon {addon_name}"),
+    )
+    .context("Refusing to add")
+}
+
+/// Check `addon` (see [`validate_addon_cmdline`]) and write it to the ESP
+/// `esp` as the `addon_type` addon `addon_name`, of `deployment` if scoped.
+fn write_addon_to_esp<R: Read + Seek>(
+    addon: &mut R,
+    esp: &Dir,
+    addon_name: &str,
+    addon_type: UkiAddonScope,
+    is_staged: bool,
+    deployment: &str,
+) -> Result<()> {
+    validate_addon_cmdline(addon, addon_name)?;
+
+    let (dest_dir, dest_name) = match addon_type {
+        UkiAddonScope::Global => {
+            let global_addons_dir = if is_staged {
+                STAGED_GLOBAL_UKI_ADDONS_DIR
+            } else {
+                GLOBAL_UKI_ADDONS_DIR
+            };
+
+            esp.create_dir_all(global_addons_dir)
+                .context("Creating global addons directory")?;
+
+            let global_addons_dir = esp
+                .open_dir(global_addons_dir)
+                .context("Opening global addons dir")?;
+
+            (global_addons_dir, get_global_uki_addon_name(addon_name))
+        }
+        UkiAddonScope::Scoped => {
+            let dir_path = Path::new(BOOTC_UKI_DIR).join(get_uki_addon_dir_name(deployment));
+
+            esp.create_dir_all(&dir_path)
+                .context("Creating addons directory")?;
+
+            let to_dir = esp
+                .open_dir(&dir_path)
+                .context("Opening addons directory")?;
+
+            (to_dir, get_scoped_uki_addon_name(addon_name))
+        }
+    };
+
+    addon
+        .seek(SeekFrom::Start(0))
+        .context("Seeking to start of addon")?;
+
+    dest_dir
+        .atomic_replace_with(&dest_name, |writer| std::io::copy(addon, writer))
+        .with_context(|| format!("Writing addon {dest_name}"))?;
+
+    rustix::fs::fsync(
+        dest_dir
+            .reopen_as_ownedfd()
+            .context("Reopening as owned fd")?,
+    )
+    .context("fsync")?;
+
+    Ok(())
+}
 
 #[context("Verifying {addon_type:?} {addon_name} addon exists")]
 fn verify_addon_exists(
@@ -358,80 +446,14 @@ pub(crate) fn handle_addon_cli_cmd(
                 .open(&addon_path)
                 .with_context(|| format!("Opening UKI Addon at {addon_path}"))?;
 
-            // UKI Addon might not even have a cmdline
-            let cmdline = uki::get_cmdline_buffered(&mut addon_file);
-
-            match cmdline {
-                Ok(ref cmdline_str) => {
-                    let cfs_cmdline_info =
-                        ComposefsBootCmdline::<Sha512HashValue>::from_cmdline(cmdline_str)
-                            .context("Parsing composefs=")?;
-
-                    if let Some(cfs_cmdline) = cfs_cmdline_info {
-                        anyhow::bail!(
-                            "composefs cmdline {cfs_cmdline:?} found in UKI Addon {addon_name}. Refusing to add"
-                        );
-                    }
-                }
-                Err(uki::UkiError::MissingSection(..)) => {
-                    // This is fine, no cmdline section
-                    // so it's just a no op
-                }
-                Err(e) => {
-                    return Err(e).context("Getting UKI cmdline");
-                }
-            };
-
-            let (dest_dir, dest_name) = match addon_type {
-                UkiAddonScope::Global => {
-                    let global_addons_dir = if is_staged {
-                        STAGED_GLOBAL_UKI_ADDONS_DIR
-                    } else {
-                        GLOBAL_UKI_ADDONS_DIR
-                    };
-
-                    esp.fd
-                        .create_dir_all(global_addons_dir)
-                        .context("Creating global addons directory")?;
-
-                    let global_addons_dir = esp
-                        .fd
-                        .open_dir(global_addons_dir)
-                        .context("Opening global addons dir")?;
-
-                    (global_addons_dir, get_global_uki_addon_name(addon_name))
-                }
-                UkiAddonScope::Scoped => {
-                    let dir_path = Path::new(BOOTC_UKI_DIR)
-                        .join(get_uki_addon_dir_name(&deployment_digest.to_hex()));
-
-                    esp.fd
-                        .create_dir_all(&dir_path)
-                        .context("Creating addons directory")?;
-
-                    let to_dir = esp
-                        .fd
-                        .open_dir(&dir_path)
-                        .context("Opening addons directory")?;
-
-                    (to_dir, get_scoped_uki_addon_name(addon_name))
-                }
-            };
-
-            addon_file
-                .seek(SeekFrom::Start(0))
-                .context("Seeking to start of addon")?;
-
-            dest_dir
-                .atomic_replace_with(&dest_name, |writer| std::io::copy(&mut addon_file, writer))
-                .with_context(|| format!("Writing addon {dest_name}"))?;
-
-            rustix::fs::fsync(
-                dest_dir
-                    .reopen_as_ownedfd()
-                    .context("Reopening as owned fd")?,
-            )
-            .context("fsync")?;
+            write_addon_to_esp(
+                &mut addon_file,
+                &esp.fd,
+                addon_name,
+                *addon_type,
+                is_staged,
+                &deployment_digest.to_hex(),
+            )?;
 
             match addon_type {
                 UkiAddonScope::Global => println!("Global UKI Addon {addon_name} added"),
@@ -478,4 +500,66 @@ pub(crate) fn handle_addon_cli_cmd(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_addon_cmdline() {
+        let pin = format!("{}={}", bootc_initramfs_setup::KARG_KMODS, "ab".repeat(64));
+        let composefs = format!("composefs={}", "cd".repeat(64));
+        let quiet_pin = format!("quiet {pin}");
+        for (cmdline, refused_for) in [
+            ("quiet", None),
+            (pin.as_str(), Some("only the UKI itself")),
+            (quiet_pin.as_str(), Some("only the UKI itself")),
+            (composefs.as_str(), Some("composefs cmdline")),
+        ] {
+            let pe = bootc_utils::create_pe_with_cmdline(cmdline.as_bytes());
+            let res = validate_addon_cmdline(&mut std::io::Cursor::new(pe), "test");
+            match refused_for {
+                None => assert!(res.is_ok(), "{cmdline}: {res:?}"),
+                Some(msg) => {
+                    let err = format!("{:#}", res.unwrap_err());
+                    assert!(err.contains(msg), "{cmdline}: {err}");
+                }
+            }
+        }
+    }
+
+    /// `uki-addon add` writes an addon to the ESP only after checking it.
+    #[test]
+    fn test_write_addon_to_esp() -> Result<()> {
+        let pin = format!("{}={}", bootc_initramfs_setup::KARG_KMODS, "ab".repeat(64));
+        let deployment = "cd".repeat(64);
+        let scoped_dir = Path::new(BOOTC_UKI_DIR).join(get_uki_addon_dir_name(&deployment));
+        for (scope, is_staged, cmdline, ok) in [
+            (UkiAddonScope::Global, false, "quiet", true),
+            (UkiAddonScope::Global, true, "quiet", true),
+            (UkiAddonScope::Scoped, false, "quiet", true),
+            (UkiAddonScope::Global, false, pin.as_str(), false),
+            (UkiAddonScope::Global, true, pin.as_str(), false),
+            (UkiAddonScope::Scoped, false, pin.as_str(), false),
+        ] {
+            let esp =
+                cap_std_ext::cap_tempfile::tempdir(cap_std_ext::cap_std::ambient_authority())?;
+            let mut addon =
+                std::io::Cursor::new(bootc_utils::create_pe_with_cmdline(cmdline.as_bytes()));
+            let res = write_addon_to_esp(&mut addon, &esp, "test", scope, is_staged, &deployment);
+            let dest = match (scope, is_staged) {
+                (UkiAddonScope::Global, false) => {
+                    Path::new(GLOBAL_UKI_ADDONS_DIR).join(get_global_uki_addon_name("test"))
+                }
+                (UkiAddonScope::Global, true) => {
+                    Path::new(STAGED_GLOBAL_UKI_ADDONS_DIR).join(get_global_uki_addon_name("test"))
+                }
+                (UkiAddonScope::Scoped, _) => scoped_dir.join(get_scoped_uki_addon_name("test")),
+            };
+            assert_eq!(res.is_ok(), ok, "{scope:?} {cmdline}: {res:?}");
+            assert_eq!(esp.try_exists(&dest)?, ok, "{scope:?} {cmdline}: {dest:?}");
+        }
+        Ok(())
+    }
 }
