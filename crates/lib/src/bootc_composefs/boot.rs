@@ -1409,6 +1409,22 @@ fn uki_file_name(file_path: &Path) -> Result<String> {
         .ok_or_else(|| anyhow!("Could not get UKI file name from {file_path}"))
 }
 
+/// Read the cmdline of a UKI stored in the repository.
+pub(crate) fn read_uki_cmdline(
+    repo: &crate::store::ComposefsRepository,
+    file: &RegularFile<Sha512HashValue>,
+) -> Result<String> {
+    let mut reader = match file {
+        RegularFile::External(id, ..) | RegularFile::ExternalNoVerity(id, ..) => {
+            std::fs::File::from(repo.open_object(id)?)
+        }
+        RegularFile::Inline(..) | RegularFile::Sparse(..) => {
+            anyhow::bail!("UKI file is not a regular external object")
+        }
+    };
+    uki::get_cmdline_buffered(&mut reader).context("Getting UKI cmdline")
+}
+
 /// Inspect primary UKIs to discover their requested fs-verity policy before
 /// creating the durable repository. Final artifact validation occurs while
 /// writing each UKI to the ESP.
@@ -1424,15 +1440,7 @@ pub(crate) fn uki_fsverity_policy(
         if !matches!(entry.pe_type, PEType::Uki) {
             continue;
         }
-        let mut reader = match &entry.file {
-            RegularFile::External(id, ..) | RegularFile::ExternalNoVerity(id, ..) => {
-                std::fs::File::from(repo.open_object(id)?)
-            }
-            RegularFile::Inline(..) | RegularFile::Sparse(..) => {
-                anyhow::bail!("UKI file is not a regular external object")
-            }
-        };
-        let cmdline = uki::get_cmdline_buffered(&mut reader).context("Getting UKI cmdline")?;
+        let cmdline = read_uki_cmdline(repo, &entry.file)?;
         let candidates = parse_uki_composefs_candidates(&cmdline).with_context(|| {
             format!(
                 "Parsing composefs kernel arguments in UKI {}",
@@ -1475,15 +1483,7 @@ fn find_expected_composefs_digest(
         if !matches!(entry.pe_type, PEType::Uki) {
             continue;
         }
-        let mut uki_reader = match &entry.file {
-            RegularFile::External(id, ..) | RegularFile::ExternalNoVerity(id, ..) => {
-                std::fs::File::from(repo.open_object(id)?)
-            }
-            RegularFile::Inline(..) | RegularFile::Sparse(..) => {
-                anyhow::bail!("UKI file is not a regular external object")
-            }
-        };
-        let cmdline = uki::get_cmdline_buffered(&mut uki_reader).context("Getting UKI cmdline")?;
+        let cmdline = read_uki_cmdline(repo, &entry.file)?;
         let candidates = parse_uki_composefs_candidates(&cmdline)
             .context("Parsing composefs kernel arguments")?;
         uki_candidates_policy(&candidates)?;
