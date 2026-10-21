@@ -92,6 +92,7 @@
 - [install reset](bootc-experimental-install-reset.7.md)
 - [--progress-fd](bootc-experimental-progress-fd.7.md)
 - [container export](bootc-experimental-container-export.7.md)
+- [separate kernel images](bootc-experimental-kernel-split.7.md)
 
 # More information
 
