@@ -11,7 +11,7 @@ use crate::bootc_composefs::status::build_composefs_karg;
 use crate::cli::ErofsVersionArg;
 use crate::kernel::KernelType;
 
-fn resolve_erofs_version(requested: Option<ErofsVersionArg>) -> FormatVersion {
+pub(crate) fn resolve_erofs_version(requested: Option<ErofsVersionArg>) -> FormatVersion {
     requested.map(Into::into).unwrap_or(FormatVersion::V1)
 }
 

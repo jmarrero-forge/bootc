@@ -369,6 +369,7 @@ pub(crate) fn prepare_boot_image(
         repo,
         &fs,
     )?;
+    crate::bootc_composefs::kmods::ensure_kmods_image(repo, &fs, &entries)?;
 
     Ok(BootImage {
         id: recovered.id,
