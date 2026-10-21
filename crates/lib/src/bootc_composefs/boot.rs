@@ -1556,6 +1556,22 @@ fn uki_file_name(file_path: &Path) -> Result<String> {
         .ok_or_else(|| anyhow!("Could not get UKI file name from {file_path}"))
 }
 
+/// Read the cmdline of a UKI stored in the repository.
+pub(crate) fn read_uki_cmdline(
+    repo: &crate::store::ComposefsRepository,
+    file: &RegularFile<Sha512HashValue>,
+) -> Result<String> {
+    let mut reader = match file {
+        RegularFile::External(id, ..) | RegularFile::ExternalNoVerity(id, ..) => {
+            std::fs::File::from(repo.open_object(id)?)
+        }
+        RegularFile::Inline(..) | RegularFile::Sparse(..) => {
+            anyhow::bail!("UKI file is not a regular external object")
+        }
+    };
+    uki::get_cmdline_buffered(&mut reader).context("Getting UKI cmdline")
+}
+
 /// Inspect primary boot artifacts to discover the image's fs-verity policy
 /// before creating the durable repository. Final artifact validation occurs
 /// while installing the boot artifact.
@@ -1567,15 +1583,7 @@ pub(crate) fn image_fsverity_policy(
     for entry in entries {
         let cmdline = match entry {
             ComposefsBootEntry::Type2(entry) if matches!(entry.pe_type, PEType::Uki) => {
-                let mut reader = match &entry.file {
-                    RegularFile::External(id, ..) | RegularFile::ExternalNoVerity(id, ..) => {
-                        std::fs::File::from(repo.open_object(id)?)
-                    }
-                    RegularFile::Inline(..) | RegularFile::Sparse(..) => {
-                        anyhow::bail!("UKI file is not a regular external object")
-                    }
-                };
-                uki::get_cmdline_buffered(&mut reader).context("Getting UKI cmdline")?
+                read_uki_cmdline(repo, &entry.file)?
             }
             ComposefsBootEntry::Aboot(entry) => {
                 let payload = read_aboot_payload(entry, repo)?;
@@ -1623,20 +1631,10 @@ fn find_expected_composefs_digest(
                     entry.payload.path.display().to_string(),
                 )
             }
-            ComposefsBootEntry::Type2(entry) if matches!(entry.pe_type, PEType::Uki) => {
-                let mut reader = match &entry.file {
-                    RegularFile::External(id, ..) | RegularFile::ExternalNoVerity(id, ..) => {
-                        std::fs::File::from(repo.open_object(id)?)
-                    }
-                    RegularFile::Inline(..) | RegularFile::Sparse(..) => {
-                        anyhow::bail!("UKI file is not a regular external object")
-                    }
-                };
-                (
-                    uki::get_cmdline_buffered(&mut reader).context("Getting UKI cmdline")?,
-                    uki_file_name(&entry.file_path)?,
-                )
-            }
+            ComposefsBootEntry::Type2(entry) if matches!(entry.pe_type, PEType::Uki) => (
+                read_uki_cmdline(repo, &entry.file)?,
+                uki_file_name(&entry.file_path)?,
+            ),
             _ => continue,
         };
         let candidates = parse_uki_composefs_candidates(&cmdline)
