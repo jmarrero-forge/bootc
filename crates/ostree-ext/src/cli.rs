@@ -257,6 +257,25 @@ pub(crate) enum ContainerImageOpts {
         check: Option<Utf8PathBuf>,
     },
 
+    /// TEST ONLY: pull an image into a temporary composefs repository and
+    /// synthesize the ostree commit from it with `import_from_composefs_repo`,
+    /// then point the image's ostree ref at that commit. This exists to test
+    /// deployments of synthesized commits until bootc gains a real caller.
+    #[clap(hide = true)]
+    TestPullViaComposefs {
+        /// Path to the repository
+        #[clap(value_parser)]
+        repo: Utf8PathBuf,
+
+        /// Image reference, e.g. ostree-unverified-image:oci-archive:/var/tmp/img.ociarchive
+        #[clap(value_parser = parse_imgref)]
+        imgref: OstreeImageReference,
+
+        /// File to which to write the resulting OSTree commit digest
+        #[clap(long)]
+        ostree_digestfile: Option<Utf8PathBuf>,
+    },
+
     /// Output metadata about an already stored container image.
     History {
         /// Path to the repository
@@ -863,6 +882,59 @@ async fn container_info(imgref: &OstreeImageReference) -> Result<()> {
     Ok(())
 }
 
+/// TEST ONLY: see [`ContainerImageOpts::TestPullViaComposefs`].
+async fn test_pull_via_composefs(
+    repo: &ostree::Repo,
+    imgref: &OstreeImageReference,
+    ostree_digestfile: Option<Utf8PathBuf>,
+) -> Result<()> {
+    use composefs_ctl::composefs::fsverity::{Algorithm, DEFAULT_LG_BLOCKSIZE, Sha512HashValue};
+    use composefs_ctl::composefs::repository::{Repository, RepositoryConfig};
+    use composefs_ctl::composefs_oci;
+    use composefs_ctl::composefs_oci::oci_image::OciImage;
+
+    // Keep the composefs repository on the same filesystem as the ostree repo
+    // so that FICLONE can share extents between them.
+    let cfs_tempdir = tempfile::tempdir_in("/var/tmp").context("Creating composefs tempdir")?;
+    let cfs_dirfd = Dir::open_ambient_dir(cfs_tempdir.path(), cap_std::ambient_authority())
+        .context("Opening composefs tempdir")?;
+    let algo = Algorithm::Sha512 {
+        lg_blocksize: DEFAULT_LG_BLOCKSIZE,
+    };
+    let config = RepositoryConfig::new(algo).set_insecure();
+    let (cfs_repo, _) = Repository::<Sha512HashValue>::init_path(cfs_dirfd, ".", config)
+        .context("Initializing composefs repository")?;
+    let cfs_repo = std::sync::Arc::new(cfs_repo);
+
+    let src = imgref.imgref.to_string();
+    let pull = composefs_oci::pull(&cfs_repo, &src, None, Default::default())
+        .await
+        .with_context(|| format!("Pulling {src} into composefs repository"))?;
+    let image = OciImage::open(&cfs_repo, &pull.manifest_digest, None)
+        .context("Opening OCI image in composefs repository")?;
+    let manifest = image.manifest().clone();
+    let config = image.config().cloned().context("OCI image has no config")?;
+    let manifest_digest = pull.manifest_digest.to_string();
+
+    let commit = crate::container::composefs_import::import_from_composefs_repo(
+        repo,
+        &cfs_repo,
+        &pull.config_digest,
+        &manifest_digest,
+        &manifest,
+        &config,
+        false,
+    )
+    .context("Synthesizing ostree commit from composefs tree")?;
+
+    let ostree_ref = crate::container::store::ref_for_image(&imgref.imgref)?;
+    repo.set_ref_immediate(None, &ostree_ref, Some(&commit), gio::Cancellable::NONE)
+        .with_context(|| format!("Setting {ostree_ref}"))?;
+    write_digest_file(ostree_digestfile, &commit)?;
+    println!("Synthesized {imgref} (digest {manifest_digest}) => {commit}");
+    Ok(())
+}
+
 /// Write a layered container image into an OSTree commit.
 async fn container_store(
     repo: &ostree::Repo,
@@ -1119,6 +1191,11 @@ async fn run_from_opt(opt: Opt) -> Result<()> {
                     container_store(&repo, &imgref, ostree_digestfile, proxyopts, quiet, check)
                         .await
                 }
+                ContainerImageOpts::TestPullViaComposefs {
+                    repo,
+                    imgref,
+                    ostree_digestfile,
+                } => test_pull_via_composefs(&parse_repo(&repo)?, &imgref, ostree_digestfile).await,
                 ContainerImageOpts::Reexport {
                     repo,
                     src_imgref,
