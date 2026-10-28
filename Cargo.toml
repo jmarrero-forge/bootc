@@ -65,7 +65,7 @@ owo-colors = { version = "4" }
 percent-encoding = "2"
 regex = "1.10.4"
 # For the same rationale as https://github.com/coreos/rpm-ostree/commit/27f3f4b77a15f6026f7e1da260408d42ccb657b3
-rustix = { "version" = "1", features = ["use-libc", "thread", "net", "fs", "system", "process", "mount"] }
+rustix = { "version" = "1.1.6", features = ["use-libc", "thread", "net", "fs", "system", "process", "mount"] }
 serde = "1.0.199"
 serde_json = "1.0.116"
 selinux = "=0.6.3"

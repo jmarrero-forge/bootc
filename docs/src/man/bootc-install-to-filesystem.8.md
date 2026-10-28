@@ -82,6 +82,12 @@ upgrade semantics: subsequent image updates do not update `/var`. The caller
 remains responsible for configuring `/etc/fstab` or mount units so the
 filesystems are mounted at the same locations on subsequent boots.
 
+Combined with `--defer-var` (see above), bootc instead copies the image's
+`/var` into `/var` as it will be at boot: the deferred state directory gets
+what is not on a mounted filesystem, and each empty mounted filesystem gets its
+part, so nothing is stored twice. With a filesystem mounted on `/var` itself,
+the state directory keeps only its marker.
+
 Tools can tell whether a bootc binary supports `--initialize-var-mounts` by
 looking for `initialize-var-mounts` in the `Features:` list of
 `bootc --version`.
