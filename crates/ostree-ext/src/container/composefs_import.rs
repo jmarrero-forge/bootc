@@ -402,8 +402,12 @@ fn write_regular_file(
                 .context("Writing inline file")?;
             Ok(csum.to_string())
         }
-        RegularFile::External(object_id, size) => {
+        RegularFile::External(object_id, size) | RegularFile::ExternalNoVerity(object_id, size) => {
             write_external_file_direct(orepo, crepo, stat, object_id, *size, xattrs, mode, ctx)
+        }
+        // Only dumpfile parsing creates these; composefs-oci rejects sparse tar entries.
+        RegularFile::Sparse(size) => {
+            anyhow::bail!("Unsupported sparse composefs file (size {size}) in OCI image")
         }
     }
 }
@@ -745,9 +749,20 @@ pub fn import_from_composefs_repo(
 ) -> Result<String> {
     let cancellable = gio::Cancellable::NONE;
 
-    // Reconstruct the merged filesystem tree from the composefs store
-    let mut fs = composefs_oci::image::create_filesystem(composefs_repo, config_digest, None)
-        .context("Reconstructing composefs filesystem tree")?;
+    // Reconstruct the merged filesystem tree from the composefs store.
+    // The default xattr filtering keeps only security.capability; also keep
+    // user.* as the closest match to the tar import path, which keeps every
+    // xattr in the layer. security.selinux is recomputed by selabel() below.
+    let transform_options = composefs_oci::OciTransformOptions {
+        xattrs: composefs_oci::XattrFiltering::KeepUserXattrs,
+    };
+    let mut fs = composefs_oci::image::create_filesystem(
+        composefs_repo,
+        config_digest,
+        None,
+        &transform_options,
+    )
+    .context("Reconstructing composefs filesystem tree")?;
 
     // Apply SELinux labels in-memory before writing any objects.
     // selabel walks the FileSystem tree and reads policy files directly from
