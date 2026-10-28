@@ -29,6 +29,7 @@ use crate::bootc_composefs::boot::BootType;
 use crate::bootc_composefs::status::{
     ComposefsCmdline, StagedDeployment, get_sorted_type1_boot_entries,
 };
+use crate::install::defer_var;
 use crate::parsers::bls_config::{BLSConfigType, EFIKey};
 use crate::store::{BootedComposefs, Storage};
 use crate::{
@@ -237,7 +238,8 @@ pub(crate) fn update_boot_digest_in_origin(
 /// * `root_path`         - The root filesystem path (typically `/sysroot`)
 /// * `deployment_id`     - Unique SHA512 hash identifier for this deployment
 /// * `imgref`            - Container image reference for the deployment
-/// * `initialize_var`    - Whether to populate the shared `/var` from the image
+/// * `initialize_var`    - Whether to populate the shared `/var` from the image,
+///                         unless `install --defer-var` marked it
 /// * `boot_type`         - Boot artifact type (`Bls`, `Uki`, or `Aboot`)
 /// * `boot_digest`       - Optional boot digest for verification
 /// * `manifest_digest`   - OCI manifest content digest, stored in the origin file so the
@@ -277,6 +279,7 @@ pub(crate) async fn write_composefs_state(
     )
     .context("Failed to create symlink for /var")?;
 
+    let initialize_var = initialize_var && !defer_var::is_marked(&actual_var_path)?;
     initialize_state(
         &root_path,
         &deployment_id.to_hex(),

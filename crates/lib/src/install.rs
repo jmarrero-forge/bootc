@@ -144,6 +144,7 @@ mod aleph;
 pub(crate) mod baseline;
 pub(crate) mod completion;
 pub(crate) mod config;
+pub(crate) mod defer_var;
 mod osbuild;
 pub(crate) mod osconfig;
 
@@ -224,6 +225,8 @@ const ALONGSIDE_ROOT_MOUNT: &str = "/target";
 pub(crate) const DESTRUCTIVE_CLEANUP: &str = "etc/bootc-destructive-cleanup";
 /// This is an ext4 special directory we need to ignore.
 const LOST_AND_FOUND: &str = "lost+found";
+/// Optional features of this binary, listed by `bootc --version`.
+pub(crate) const FEATURES: &[&str] = &[defer_var::FEATURE];
 /// The mount path for selinux
 const SELINUXFS: &str = "/sys/fs/selinux";
 /// The mount path for uefi
@@ -590,6 +593,13 @@ pub(crate) struct InstallTargetFilesystemOpts {
     /// its UUID will be used.
     #[clap(long)]
     pub(crate) boot_mount_spec: Option<String>,
+
+    /// Do not seed the deployment's state directory with the image's /var.
+    ///
+    /// The installed system then starts with an empty /var, for the caller
+    /// to fill, e.g. on a separate filesystem.
+    #[clap(long)]
+    pub(crate) defer_var: bool,
 
     /// Initialize the system in-place; at the moment, only one mode for this is implemented.
     /// In the future, it may also be supported to set up an explicit "dual boot" system.
@@ -1135,10 +1145,14 @@ async fn initialize_ostree_root(state: &State, root_setup: &RootSetup) -> Result
     // so only create it via init_osname if it doesn't exist
     // (ideally this would be handled by init_osname)
     let stateroot_path = format!("ostree/deploy/{stateroot}");
-    if !sysroot_dir.try_exists(stateroot_path)? {
+    if !sysroot_dir.try_exists(&stateroot_path)? {
         sysroot
             .init_osname(stateroot, cancellable)
             .context("initializing stateroot")?;
+    }
+    if root_setup.defer_var {
+        let var = format!("{stateroot_path}/var");
+        defer_var::mark(&sysroot_dir, var.as_str().into(), sepolicy)?;
     }
 
     state.tempdir.create_dir("temp-run")?;
@@ -1481,6 +1495,8 @@ pub(crate) struct RootSetup {
     pub(crate) disk_install: bool,
     /// True if we should skip finalizing
     skip_finalize: bool,
+    /// Do not seed the stateroot's /var from the image
+    pub(crate) defer_var: bool,
     boot: Option<MountSpec>,
     pub(crate) kargs: CmdlineOwned,
 }
@@ -2328,6 +2344,13 @@ async fn install_to_filesystem_impl(
         let allow_missing_verity = requested_relaxed;
         tag_pulled_image(&rootfs.physical_root, &pull_result)?;
 
+        if rootfs.defer_var {
+            defer_var::mark(
+                &rootfs.physical_root,
+                crate::composefs_consts::SHARED_VAR_PATH.into(),
+                state.load_policy()?.as_ref(),
+            )?;
+        }
         setup_composefs_boot(rootfs, state, &pull_result, allow_missing_verity).await?;
 
         // Label composefs objects as /usr so they get usr_t rather than
@@ -2736,6 +2759,24 @@ pub enum Cleanup {
     TriggerOnNextBoot,
 }
 
+/// Reinstalling over or alongside an existing OS must not defer its live
+/// /var. Checked before anything on the target is changed.
+fn check_defer_var(
+    defer_var: bool,
+    targeting_host_root: bool,
+    is_already_ostree: bool,
+    replace: Option<ReplaceMode>,
+) -> Result<()> {
+    anyhow::ensure!(
+        !defer_var
+            || !(targeting_host_root
+                || is_already_ostree
+                || replace == Some(ReplaceMode::Alongside)),
+        "--defer-var is not supported over an existing ostree system or with --replace=alongside"
+    );
+    Ok(())
+}
+
 /// Implementation of the `bootc install to-filesystem` CLI command.
 #[context("Installing to filesystem")]
 pub(crate) async fn install_to_filesystem(
@@ -2818,6 +2859,12 @@ pub(crate) async fn install_to_filesystem(
         );
         fsopts.root_path = possible_physical_root;
     };
+    check_defer_var(
+        fsopts.defer_var,
+        targeting_host_root,
+        is_already_ostree,
+        fsopts.replace,
+    )?;
 
     // Get a file descriptor for the root path
     // It will be /target/sysroot on ostree OS, or will be /target
@@ -3014,6 +3061,7 @@ pub(crate) async fn install_to_filesystem(
         boot,
         kargs,
         skip_finalize,
+        defer_var: fsopts.defer_var,
     };
 
     install_to_filesystem_impl(&state, &mut rootfs, cleanup).await?;
@@ -3061,6 +3109,7 @@ pub(crate) async fn install_to_existing_root(opts: InstallToExistingRootOpts) ->
             root_path: opts.root_path,
             root_mount_spec: None,
             boot_mount_spec: None,
+            defer_var: false,
             replace: opts.replace,
             skip_finalize: true,
             acknowledge_destructive: opts.acknowledge_destructive,
@@ -3253,6 +3302,30 @@ pub(crate) async fn install_finalize(target: &Utf8Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_check_defer_var() {
+        use ReplaceMode::*;
+        // (defer, host root, already ostree, replace, allowed)
+        let cases = [
+            (false, true, true, Some(Alongside), true),
+            (true, false, false, None, true),
+            (true, false, false, Some(Wipe), true),
+            (true, false, false, Some(Alongside), false),
+            (true, false, true, None, false),
+            (true, true, false, None, false),
+        ];
+        for (defer, host_root, ostree, replace, allowed) in cases {
+            let r = check_defer_var(defer, host_root, ostree, replace);
+            assert_eq!(
+                r.err().map(|e| e.to_string()),
+                (!allowed).then(|| "--defer-var is not supported over an existing ostree \
+                     system or with --replace=alongside"
+                    .to_owned()),
+                "{defer} {host_root} {ostree} {replace:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_composefs_opts_validate() {

@@ -16,6 +16,26 @@ necessary platform partitions (such as the EFI system partition) are
 prepared and mounted by an external tool or script. The root filesystem
 is currently expected to be empty by default.
 
+With `--defer-var`, the deployment's state directory for `/var`
+(`ostree/deploy/STATEROOT/var`, or `state/os/default/var` with composefs) is not
+seeded from the image's `/var`, and the installed system starts with an empty
+`/var` for the caller to fill, for example on a separate filesystem. Before the
+first deployment, bootc writes an empty `.bootc-defer-var` file there, which
+keeps both backends from seeding it, then and on later deployments: libostree
+seeds the state directory only while it is empty, and bootc's composefs backend
+checks for the file. On composefs, that check matters only at installation,
+since later deployments never seed `/var`. The file stays, as a record that
+`/var` was deferred.
+With `--defer-var` alone, the caller must fill `/var`, or the filesystems
+mounted there, before the first boot. An empty `/var` is not a supported
+first-boot state: on composefs it is already visible in the initramfs, before
+the SELinux policy is loaded, and directories created there then (such as
+`/var/lib`, for `/var/lib/nfs/rpc_pipefs`) are unlabeled, which can keep a
+mount below them from working.
+`--defer-var` is an error over an existing ostree system or with
+`--replace=alongside`. Tools can tell whether a bootc binary supports it by
+looking for `defer-var` in the `Features:` list of `bootc --version`.
+
 # OPTIONS
 
 <!-- BEGIN GENERATED OPTIONS -->
@@ -32,6 +52,10 @@ is currently expected to be empty by default.
 **--boot-mount-spec**=*BOOT_MOUNT_SPEC*
 
     Mount specification for the /boot filesystem
+
+**--defer-var**
+
+    Do not seed the deployment's state directory with the image's /var
 
 **--replace**=*REPLACE*
 
