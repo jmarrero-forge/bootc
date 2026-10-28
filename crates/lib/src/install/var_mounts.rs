@@ -1,6 +1,7 @@
 //! Initialize caller-mounted /var filesystems from the image's /var.
 
 use std::ffi::CString;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
@@ -292,24 +293,93 @@ impl CopyView {
     }
 }
 
-/// Fill each empty filesystem among `mounts` (relative to /var, below
-/// `root_path`) with its part of the image's /var, one `cp` per filesystem.
-/// Hardlinks within one filesystem are kept where the source has them;
-/// those spanning filesystems become separate files. Filesystems that
-/// already hold data are left alone, but empty filesystems below and above
-/// them are still filled.
+/// Give the directory `dst` the ownership, mode, extended attributes (such as
+/// ACLs, but not the SELinux label) and timestamps of `src`, as `cp -a` would.
+fn copy_dir_metadata(src: &Utf8Path, dst: &Utf8Path) -> Result<()> {
+    use rustix::fs::{AtFlags, Timespec, Timestamps, XattrFlags};
+    let context = || format!("Copying the metadata of {src} to {dst}");
+    let meta = src.symlink_metadata().with_context(context)?;
+    std::os::unix::fs::lchown(dst, Some(meta.uid()), Some(meta.gid())).with_context(context)?;
+    std::fs::set_permissions(dst, std::fs::Permissions::from_mode(meta.mode() & 0o7777))
+        .with_context(context)?;
+    let mut names =
+        vec![0u8; rustix::fs::llistxattr(src.as_str(), &mut [0u8; 0][..]).with_context(context)?];
+    let len = rustix::fs::llistxattr(src.as_str(), &mut names[..]).with_context(context)?;
+    names.truncate(len);
+    // Like cp -a, skip what can't be set. The SELinux label is set when the
+    // stateroot var is relabeled afterwards anyway.
+    for name in names
+        .split(|b| *b == 0)
+        .filter(|n| !n.is_empty() && *n != b"security.selinux")
+    {
+        let name = CString::new(name)?;
+        let mut value = vec![
+            0u8;
+            rustix::fs::lgetxattr(src.as_str(), &name, &mut [0u8; 0][..])
+                .with_context(context)?
+        ];
+        let len =
+            rustix::fs::lgetxattr(src.as_str(), &name, &mut value[..]).with_context(context)?;
+        match rustix::fs::lsetxattr(dst.as_str(), &name, &value[..len], XattrFlags::empty()) {
+            Ok(()) => {}
+            Err(e @ (rustix::io::Errno::NOTSUP | rustix::io::Errno::PERM)) => {
+                tracing::debug!("Not copying {name:?} to {dst}: {e}");
+            }
+            Err(e) => return Err(e).with_context(context),
+        }
+    }
+    let time = |sec, nsec| Timespec {
+        tv_sec: sec,
+        tv_nsec: nsec as _,
+    };
+    let times = Timestamps {
+        last_access: time(meta.atime(), meta.atime_nsec()),
+        last_modification: time(meta.mtime(), meta.mtime_nsec()),
+    };
+    rustix::fs::utimensat(
+        rustix::fs::CWD,
+        dst.as_str(),
+        &times,
+        AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .with_context(context)?;
+    Ok(())
+}
+
+/// What [`populate`] initialized, or left empty because the image has no
+/// content for it. These still need labeling and syncing.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Prepared {
+    /// The stateroot's var, which is /var at boot unless a filesystem is
+    /// mounted there.
+    pub(crate) stateroot_var: bool,
+    /// Mounts, relative to /var.
+    pub(crate) mounts: Vec<Utf8PathBuf>,
+}
+
+/// Fill each empty filesystem of /var as it will be at boot with its part of
+/// the image's /var, one `cp` per filesystem: the filesystems in `mounts`
+/// (relative to /var, below `root_path`), and a stateroot var that
+/// `--defer-var` left unseeded (`stateroot_var`, relative to `root_path`)
+/// unless one is mounted on /var. Content below a mountpoint goes only to
+/// the filesystem mounted there, so each file is stored once. Hardlinks within one
+/// filesystem are kept where the source has them; those spanning filesystems
+/// become separate files. Filesystems that already hold data are left alone,
+/// but empty filesystems below and above them are still filled.
 ///
-/// The filesystems that were initialized, or left empty because the image
-/// has no content for them, are added to `prepared` as it goes. These still
-/// need labeling and syncing, also after an error: see [`finish`].
+/// What was filled, or left empty for lack of image content, is recorded in
+/// `prepared` as it goes, so that after an error the filesystems completed
+/// before it can still be finished: see [`finish`].
 pub(crate) fn populate(
     root: &Dir,
     root_path: &Utf8Path,
+    stateroot_var: Option<&Utf8Path>,
     mounts: &[Utf8PathBuf],
     source: &ImageVar,
-    prepared: &mut Vec<Utf8PathBuf>,
+    prepared: &mut Prepared,
 ) -> Result<()> {
-    if mounts.is_empty() {
+    let stateroot_var = stateroot_var.filter(|_| !mounts.iter().any(|m| m.as_str().is_empty()));
+    if mounts.is_empty() && stateroot_var.is_none() {
         return Ok(());
     }
     let root_path = root_path
@@ -317,6 +387,33 @@ pub(crate) fn populate(
         .with_context(|| format!("Resolving {root_path}"))?;
     let source_dir = Dir::open_ambient_dir(&source.path, ambient_authority())
         .with_context(|| format!("Opening {}", source.path))?;
+    if let Some(var) = stateroot_var {
+        // It only holds the marker (and on ostree, libostree's
+        // .ostree-selabeled stamp), which the image's /var doesn't have.
+        // The mountpoints are not mounted here: they get an empty
+        // directory, like the image's, and no content.
+        let mut view = CopyView::default();
+        for m in children("".into(), mounts) {
+            if check_source_path(&source_dir, m)? {
+                view.hide_source.push(source.path.join(m));
+            }
+        }
+        println!("Initializing /var from the image");
+        logged_copy(
+            &view,
+            &source.path,
+            &root_path,
+            CopyTarget::StaterootVar(var),
+            source.hardlinks,
+        )?;
+        let target = root_path.join(var);
+        // cp gave them the metadata of what hid the image's directories
+        for hidden in &view.hide_source {
+            let path = hidden.strip_prefix(&source.path)?;
+            copy_dir_metadata(hidden, &target.join(path))?;
+        }
+        prepared.stateroot_var = true;
+    }
     for mount in mounts {
         let target = target_path(mount);
         let nested = children(mount, mounts);
@@ -332,7 +429,7 @@ pub(crate) fn populate(
         }
         if !check_source_path(&source_dir, mount)? {
             println!("No initial content for /{target} in the image");
-            prepared.push(mount.clone());
+            prepared.mounts.push(mount.clone());
             continue;
         }
         let mut view = CopyView::default();
@@ -347,10 +444,10 @@ pub(crate) fn populate(
             &view,
             &source.path.join(mount),
             &root_path,
-            &target,
+            CopyTarget::Mount(mount),
             source.hardlinks,
         )?;
-        prepared.push(mount.clone());
+        prepared.mounts.push(mount.clone());
     }
     Ok(())
 }
@@ -380,9 +477,20 @@ fn finish_with<T>(
     })
 }
 
-/// What [`finish`] does to each prepared filesystem: [`Finish`] does it,
+/// Something [`populate`] prepared, to finish.
+enum Finishing<'a> {
+    /// The deferred stateroot var, to label as /var
+    StaterootVar(&'a Utf8Path),
+    /// A filesystem mounted below /var, to label and sync
+    Mount(&'a Utf8Path),
+}
+
+/// What [`finish`] does to what [`populate`] prepared: [`Finish`] does it,
 /// tests record it.
 trait Finisher {
+    /// SELinux label the deferred stateroot var at `var` (relative to the
+    /// root) as /var
+    fn label_stateroot_var(&mut self, var: &Utf8Path) -> Result<()>;
     /// SELinux label the filesystem at `mount` (relative to /var)
     fn label(&mut self, mount: &Utf8Path) -> Result<()>;
     /// Flush the filesystem at `mount` (relative to /var)
@@ -396,6 +504,15 @@ struct Finish<'a> {
 }
 
 impl Finisher for Finish<'_> {
+    fn label_stateroot_var(&mut self, var: &Utf8Path) -> Result<()> {
+        let Some(policy) = self.policy else {
+            return Ok(());
+        };
+        // Like libostree does when it seeds /var.
+        crate::lsm::relabel_recurse(self.root, var, Some("/var".into()), policy)
+            .context("SELinux labeling of /var")
+    }
+
     fn label(&mut self, mount: &Utf8Path) -> Result<()> {
         self.policy
             .map_or(Ok(()), |policy| label(self.root, mount, policy))
@@ -406,33 +523,53 @@ impl Finisher for Finish<'_> {
     }
 }
 
-/// Label (given a `policy`) and sync each filesystem that [`populate`]
-/// prepared, then return its result, `populated`. Filesystems it completed
-/// before failing are finished too, since a retry leaves them alone as
-/// holding data, and one filesystem failing doesn't stop the others.
+/// Label (given a `policy`) what [`populate`] prepared, and sync each
+/// filesystem, then return its result, `populated`. The `stateroot_var` is
+/// the one passed to it. Filesystems it completed before failing are
+/// finished too, since a retry leaves them alone as holding data, and one
+/// failing doesn't stop the others.
 pub(crate) fn finish(
     root: &Dir,
-    prepared: &[Utf8PathBuf],
+    stateroot_var: Option<&Utf8Path>,
+    prepared: &Prepared,
     policy: Option<&ostree::SePolicy>,
     populated: Result<()>,
 ) -> Result<()> {
-    finish_using(&mut Finish { root, policy }, prepared, populated)
+    finish_using(
+        &mut Finish { root, policy },
+        stateroot_var,
+        prepared,
+        populated,
+    )
 }
 
 /// [`finish`] with `finisher`: each filesystem is synced even when
 /// labeling it failed.
 fn finish_using(
     finisher: &mut impl Finisher,
-    prepared: &[Utf8PathBuf],
+    stateroot_var: Option<&Utf8Path>,
+    prepared: &Prepared,
     populated: Result<()>,
 ) -> Result<()> {
+    let stateroot_var = stateroot_var
+        .filter(|_| prepared.stateroot_var)
+        .map(Finishing::StaterootVar);
+    let mounts = prepared
+        .mounts
+        .iter()
+        .map(|m| Finishing::Mount(m.as_path()));
     finish_with(
-        prepared,
-        |mount| {
-            [finisher.label(mount), finisher.sync(mount)]
+        stateroot_var.into_iter().chain(mounts),
+        |item| match item {
+            Finishing::StaterootVar(var) => finisher
+                .label_stateroot_var(var)
+                .err()
+                .into_iter()
+                .collect(),
+            Finishing::Mount(mount) => [finisher.label(mount), finisher.sync(mount)]
                 .into_iter()
                 .filter_map(Result::err)
-                .collect()
+                .collect(),
         },
         populated,
     )
@@ -464,33 +601,60 @@ fn journal_var_event(priority: Priority, msg: &str, target: &Utf8Path, fs: &str)
     );
 }
 
-/// Copy `source` into `target` (relative to `root_path`, its path at boot)
-/// with `view`, logging the result to the journal. A failed copy may leave
-/// the target partly filled, which later runs take as holding data, so the
-/// error says so.
+/// What a copy fills, for its messages and journal entries.
+#[derive(Clone, Copy)]
+enum CopyTarget<'a> {
+    /// The filesystem mounted at this path (relative to /var) at boot
+    Mount(&'a Utf8Path),
+    /// The deferred stateroot var at this path (relative to the root),
+    /// which is /var at boot
+    StaterootVar(&'a Utf8Path),
+}
+
+/// Copy `source` into `target` (below `root_path`) with `view`, logging the
+/// result to the journal. A failed copy may leave the target partly filled.
+/// A filesystem then counts as holding data in later runs, so the error
+/// says so; the stateroot var is filled only at installation.
 fn logged_copy(
     view: &CopyView,
     source: &Utf8Path,
     root_path: &Utf8Path,
-    target: &Utf8Path,
+    target: CopyTarget,
     hardlinks: bool,
 ) -> Result<()> {
-    let path = root_path.join(target);
+    let (path, name, boot_path) = match target {
+        CopyTarget::Mount(mount) => {
+            let target = target_path(mount);
+            (root_path.join(&target), format!("/{target}"), target)
+        }
+        CopyTarget::StaterootVar(var) => (
+            root_path.join(var),
+            format!("/var (the deployment's state directory, /{var})"),
+            VAR.into(),
+        ),
+    };
     let fs = mount_source(&path);
     match view.copy(source, &path, hardlinks) {
         Ok(()) => {
-            let msg = format!("Initialized /{target} ({fs}) from the image");
-            journal_var_event(Priority::Info, &msg, target, &fs);
+            let msg = format!("Initialized {name} ({fs}) from the image");
+            journal_var_event(Priority::Info, &msg, &boot_path, &fs);
             Ok(())
         }
         Err(e) => {
-            let msg = format!(
-                "Initializing /{target} ({fs}) from the image failed, which may have left \
-                 it partly filled. Only empty filesystems are initialized, so a partly \
-                 filled one will not be initialized again: empty it (e.g. recreate the \
-                 filesystem) and run this again, or complete it by hand"
-            );
-            journal_var_event(Priority::Error, &format!("{msg}: {e:#}"), target, &fs);
+            let msg = match target {
+                CopyTarget::Mount(_) => format!(
+                    "Initializing {name} ({fs}) from the image failed, which may have left \
+                     it partly filled. Only empty filesystems are initialized, so a partly \
+                     filled one will not be initialized again: empty it (e.g. recreate the \
+                     filesystem) and run this again, or complete it by hand"
+                ),
+                CopyTarget::StaterootVar(_) => format!(
+                    "Initializing {name} ({fs}) from the image failed, which may have left \
+                     it partly filled. This is part of the installation: install again \
+                     onto a fresh root filesystem"
+                ),
+            };
+            journal_var_event(Priority::Error, &format!("{msg}: {e:#}"), &boot_path, &fs);
             Err(e.context(msg))
         }
     }
@@ -550,15 +714,23 @@ mod tests {
     use cap_std_ext::cap_std::fs::{MetadataExt, Permissions, PermissionsExt};
     use cap_std_ext::cap_tempfile::TempDir;
 
-    /// [`populate`] into a fresh list.
+    /// [`populate`] into a fresh [`Prepared`].
     fn populated(
         root: &Dir,
         root_path: &Utf8Path,
+        stateroot_var: Option<&Utf8Path>,
         mounts: &[Utf8PathBuf],
         source: &ImageVar,
-    ) -> Result<Vec<Utf8PathBuf>> {
-        let mut prepared = Vec::new();
-        populate(root, root_path, mounts, source, &mut prepared)?;
+    ) -> Result<Prepared> {
+        let mut prepared = Prepared::default();
+        populate(
+            root,
+            root_path,
+            stateroot_var,
+            mounts,
+            source,
+            &mut prepared,
+        )?;
         Ok(prepared)
     }
 
@@ -669,7 +841,9 @@ mod tests {
         }
 
         fn populate(&self, mounts: &[Utf8PathBuf]) -> Result<Vec<Utf8PathBuf>> {
-            populated(&self.dir, &self.path, mounts, &self.image())
+            let prepared = populated(&self.dir, &self.path, None, mounts, &self.image())?;
+            assert!(!prepared.stateroot_var);
+            Ok(prepared.mounts)
         }
     }
 
@@ -764,18 +938,25 @@ mod tests {
         root.create_dir_all("var/opt/app")?;
         root.create_dir_all("var/srv/b")?;
         let mounts = paths(&["opt/app", "srv/b"]);
-        let mut prepared = Vec::new();
-        let populated = populate(&root, &root.path, &mounts, &root.image(), &mut prepared);
+        let mut prepared = Prepared::default();
+        let populated = populate(
+            &root,
+            &root.path,
+            None,
+            &mounts,
+            &root.image(),
+            &mut prepared,
+        );
         let copy_error = format!("{:#}", populated.as_ref().unwrap_err());
         assert!(copy_error.contains("/var/srv"), "{copy_error}");
-        assert_eq!(prepared, paths(&["opt/app"]));
+        assert_eq!(prepared.mounts, paths(&["opt/app"]));
         assert_eq!(root.read_to_string("var/opt/app/seed")?, "image seed");
         let mut recorder = Recorder::default();
-        let err = finish_using(&mut recorder, &prepared, populated).unwrap_err();
+        let err = finish_using(&mut recorder, None, &prepared, populated).unwrap_err();
         assert_eq!(recorder.calls, ["label opt/app", "sync opt/app"]);
         assert_eq!(format!("{err:#}"), copy_error);
         // The real thing: sync works on a temporary directory
-        finish(&root, &prepared, None, Ok(()))?;
+        finish(&root, None, &prepared, None, Ok(()))?;
         Ok(())
     }
 
@@ -799,6 +980,10 @@ mod tests {
     }
 
     impl Finisher for Recorder {
+        fn label_stateroot_var(&mut self, var: &Utf8Path) -> Result<()> {
+            self.call(format!("label {var} as /var"))
+        }
+
         fn label(&mut self, mount: &Utf8Path) -> Result<()> {
             self.call(format!("label {mount}"))
         }
@@ -810,36 +995,56 @@ mod tests {
 
     #[test]
     fn finish_after_failure() {
-        // Labeling the first filesystem fails, and syncing the second: each
-        // is still synced, and finished, and the errors are reported after
-        // the copy error.
-        let mounts = paths(&["opt/app", "srv"]);
+        // Labeling the stateroot var fails, and the first filesystem, and
+        // syncing the second: each filesystem is still synced, and finished,
+        // and the errors are reported after the copy error.
+        let prepared = Prepared {
+            stateroot_var: true,
+            mounts: paths(&["opt/app", "srv"]),
+        };
+        let stateroot_var = Some(Utf8Path::new("state/var"));
         for populated in [Ok(()), Err(anyhow::anyhow!("copy failed"))] {
             let copy_failed = populated.is_err();
             let mut recorder = Recorder {
-                fail: vec!["label opt/app", "sync srv"],
+                fail: vec!["label state/var as /var", "label opt/app", "sync srv"],
                 ..Default::default()
             };
-            let err = finish_using(&mut recorder, &mounts, populated)
+            let err = finish_using(&mut recorder, stateroot_var, &prepared, populated)
                 .unwrap_err()
                 .to_string();
             assert_eq!(
                 recorder.calls,
-                ["label opt/app", "sync opt/app", "label srv", "sync srv"]
+                [
+                    "label state/var as /var",
+                    "label opt/app",
+                    "sync opt/app",
+                    "label srv",
+                    "sync srv"
+                ]
             );
+            let failures = "label state/var as /var failed; label opt/app failed; sync srv failed";
             let expected = if copy_failed {
-                "copy failed; finishing the filesystems initialized before that also failed: \
-                 label opt/app failed; sync srv failed"
+                format!(
+                    "copy failed; finishing the filesystems initialized before that also failed: {failures}"
+                )
             } else {
-                "Finishing the initialized filesystems failed: label opt/app failed; sync srv failed"
+                format!("Finishing the initialized filesystems failed: {failures}")
             };
             assert_eq!(err, expected);
         }
+        // A stateroot var that populate didn't fill isn't labeled
+        let mut recorder = Recorder::default();
+        let unfilled = Prepared {
+            stateroot_var: false,
+            ..Default::default()
+        };
+        finish_using(&mut recorder, stateroot_var, &unfilled, Ok(())).unwrap();
+        assert!(recorder.calls.is_empty());
         // Nothing to finish, or nothing failing: populate's result as is
-        assert!(finish_using(&mut Recorder::default(), &[], Ok(())).is_ok());
         let err = finish_using(
             &mut Recorder::default(),
-            &mounts,
+            stateroot_var,
+            &prepared,
             Err(anyhow::anyhow!("copy failed")),
         );
         assert_eq!(err.unwrap_err().to_string(), "copy failed");
@@ -889,6 +1094,15 @@ mod tests {
         // Syncing opens the filesystem: a missing one fails
         finish.sync("opt/app".into())?;
         assert!(finish.sync("missing".into()).is_err());
+        // The stateroot var is labeled as /var, whatever its path
+        root.create_dir_all("state/var/lib")?;
+        for p in ["state/var", "state/var/lib"] {
+            unlabel(&root, p)?;
+        }
+        finish.label_stateroot_var("state/var".into())?;
+        for p in ["state/var", "state/var/lib"] {
+            assert_eq!(label(&root, p)?, VAR, "{p}");
+        }
         Ok(())
     }
 
@@ -923,6 +1137,75 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_stateroot_var() -> Result<()> {
+        // (mounts, whether the stateroot var is filled)
+        let cases: &[(&[&str], bool)] = &[
+            (&[], true),
+            (&["srv"], true),
+            // Hidden at boot by a /var filesystem
+            (&[""], false),
+        ];
+        for (mounts, filled) in cases {
+            let root = image_root()?;
+            root.create_dir_all("state")?;
+            crate::install::defer_var::mark(&root, "state/var".into(), None)?;
+            let mounts = paths(mounts);
+            for m in &mounts {
+                root.create_dir_all(target_path(m))?;
+            }
+            let prepared = populated(
+                &root,
+                &root.path,
+                Some("state/var".into()),
+                &mounts,
+                &root.image(),
+            )?;
+            assert_eq!(prepared.stateroot_var, *filled, "{mounts:?}");
+            assert_eq!(
+                root.try_exists("state/var/opt/app/seed")?,
+                *filled,
+                "{mounts:?}"
+            );
+            let marker = Utf8Path::new("state/var").join(crate::install::defer_var::MARKER);
+            assert!(root.try_exists(marker)?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_stateroot_var_failure() -> Result<()> {
+        // A file where the image has a directory stops cp, also as root
+        let root = image_root()?;
+        root.create_dir_all("state")?;
+        crate::install::defer_var::mark(&root, "state/var".into(), None)?;
+        root.write("state/var/opt", "not a directory")?;
+        let mut prepared = Prepared::default();
+        let err = populate(
+            &root,
+            &root.path,
+            Some("state/var".into()),
+            &[],
+            &root.image(),
+            &mut prepared,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.starts_with("Initializing /var (the deployment's state directory, /state/var) ("),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(
+                "partly filled. This is part of the installation: install again onto a fresh \
+                 root filesystem: "
+            ),
+            "{msg}"
+        );
+        assert!(!prepared.stateroot_var);
         Ok(())
     }
 
@@ -1053,6 +1336,12 @@ mod tests {
             root.write("image/var/opt/app/seed", "seed")?;
             root.set_permissions("image/var/opt/app/seed", Permissions::from_mode(0o640))?;
             root.set_permissions("image/var/opt/app", Permissions::from_mode(0o750))?;
+            rustix::fs::lsetxattr(
+                path.join("image/var/opt/app").as_str(),
+                c"user.test",
+                b"image",
+                rustix::fs::XattrFlags::empty(),
+            )?;
             root.hard_link("image/var/opt/app/seed", &root, "image/var/parent-link")?;
             root.hard_link(
                 "image/var/opt/app/seed",
@@ -1080,7 +1369,7 @@ mod tests {
             let mounts = discover(path)?;
             assert_eq!(mounts, paths(&["", "opt/app", "opt/app/data"]));
             assert_eq!(
-                populated(&root, path, &mounts, &image)?,
+                populated(&root, path, None, &mounts, &image)?.mounts,
                 paths(&["", "opt/app"])
             );
             // Copying /var/opt/app didn't touch the root of the volume
@@ -1124,11 +1413,36 @@ mod tests {
             root.write("var/opt/app/seed", "existing state")?;
             let mounts = discover(path)?;
             assert_eq!(
-                populated(&root, path, &mounts, &image)?,
+                populated(&root, path, None, &mounts, &image)?.mounts,
                 paths(&["opt/app/data"])
             );
             assert_eq!(root.read_to_string("var/opt/app/seed")?, "existing state");
             assert_eq!(root.read_to_string("var/opt/app/data/db")?, "image db");
+
+            // No /var filesystem: a deferred stateroot var gets everything
+            // but what the nested filesystems hold, which goes only there.
+            bootc_mount::unmount_recursive(&path.join("var"))?;
+            root.create_dir_all("var/opt/app")?;
+            tmpfs("var/opt/app")?;
+            crate::install::defer_var::mark(&root, "state/var".into(), None)?;
+            let mounts = discover(path)?;
+            assert_eq!(mounts, paths(&["opt/app"]));
+            let prepared = populated(&root, path, Some("state/var".into()), &mounts, &image)?;
+            assert!(prepared.stateroot_var);
+            assert_eq!(prepared.mounts, mounts);
+            assert_eq!(root.read_to_string("state/var/opt/top")?, "top");
+            assert_eq!(root.read_to_string("state/var/parent-link")?, "seed");
+            assert_eq!(root.read_to_string("var/opt/app/seed")?, "seed");
+            // Only the mountpoint, like the image's
+            assert_eq!(root.read_dir("state/var/opt/app")?.count(), 0);
+            assert_eq!(root.metadata("state/var/opt/app")?.mode() & 0o777, 0o750);
+            let mut value = [0u8; 16];
+            let len = rustix::fs::lgetxattr(
+                path.join("state/var/opt/app").as_str(),
+                c"user.test",
+                &mut value[..],
+            )?;
+            assert_eq!(&value[..len], b"image");
             Ok(())
         })();
         let unmount = bootc_mount::unmount_recursive(path);
