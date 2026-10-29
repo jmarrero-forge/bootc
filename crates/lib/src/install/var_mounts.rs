@@ -27,6 +27,9 @@ use super::LOST_AND_FOUND;
 /// Older versions leave /var filesystems empty, or reject them entirely.
 pub(crate) const FEATURE: &str = "initialize-var-mounts";
 
+/// Listed by `bootc --version` for `bootc state initialize-var`.
+pub(crate) const STATE_FEATURE: &str = "state-initialize-var";
+
 const VAR: &str = "var";
 
 /// Journal message ID of the events of initializing /var filesystems from
@@ -44,28 +47,49 @@ pub(crate) fn target_path(mount: &Utf8Path) -> Utf8PathBuf {
 
 /// Mount paths relative to /var, including the empty path for /var itself.
 pub(crate) fn discover(root: &Utf8Path) -> Result<Vec<Utf8PathBuf>> {
+    discover_matching(root, |_| true)
+}
+
+/// Like [`discover`], but only the filesystems for which `keep` is true.
+fn discover_matching(root: &Utf8Path, keep: fn(&Filesystem) -> bool) -> Result<Vec<Utf8PathBuf>> {
     let root = root
         .canonicalize_utf8()
         .context("Resolving installation root")?;
     let mounts =
         bootc_mount::run_findmnt(&["--submounts", "--mountpoint"], None, Some(root.as_str()))?;
     let mut paths = Vec::new();
-    collect(&root.join(VAR), &mounts.filesystems, &mut paths);
+    collect(&root.join(VAR), &mounts.filesystems, keep, &mut paths);
     paths.sort();
     paths.dedup();
     Ok(paths)
 }
 
-fn collect(var: &Utf8Path, mounts: &[Filesystem], paths: &mut Vec<Utf8PathBuf>) {
+fn collect(
+    var: &Utf8Path,
+    mounts: &[Filesystem],
+    keep: fn(&Filesystem) -> bool,
+    paths: &mut Vec<Utf8PathBuf>,
+) {
     for mount in mounts {
         // An error here only means the mount is outside the target's /var.
         if let Ok(path) = Utf8Path::new(&mount.target).strip_prefix(var) {
-            paths.push(path.to_owned());
+            if keep(mount) {
+                paths.push(path.to_owned());
+            }
         }
         if let Some(children) = &mount.children {
-            collect(var, children, paths);
+            collect(var, children, keep, paths);
         }
     }
+}
+
+/// Whether a filesystem is a block device's filesystem mounted at its root, or /var
+/// itself (on ostree and composefs a bind mount of the state directory). On
+/// a booted system, /var also holds other software's mounts, such as
+/// container tmpfs mounts, network filesystems and bind mounts of host
+/// directories, which aren't ours to fill or label.
+fn is_block_backed(fs: &Filesystem) -> bool {
+    fs.source.starts_with("/dev/") && (!fs.source.contains('[') || fs.target == "/var")
 }
 
 /// The filesystems directly below `parent` among `mounts`: the ones with no
@@ -378,8 +402,30 @@ pub(crate) fn populate(
     source: &ImageVar,
     prepared: &mut Prepared,
 ) -> Result<()> {
+    populate_targets(
+        root,
+        root_path,
+        stateroot_var,
+        mounts,
+        mounts,
+        source,
+        prepared,
+    )
+}
+
+/// [`populate`], filling only the `targets` among `mounts`; the others are
+/// still boundaries, hidden from the copies and not counted as data.
+fn populate_targets(
+    root: &Dir,
+    root_path: &Utf8Path,
+    stateroot_var: Option<&Utf8Path>,
+    mounts: &[Utf8PathBuf],
+    targets: &[Utf8PathBuf],
+    source: &ImageVar,
+    prepared: &mut Prepared,
+) -> Result<()> {
     let stateroot_var = stateroot_var.filter(|_| !mounts.iter().any(|m| m.as_str().is_empty()));
-    if mounts.is_empty() && stateroot_var.is_none() {
+    if targets.is_empty() && stateroot_var.is_none() {
         return Ok(());
     }
     let root_path = root_path
@@ -414,7 +460,7 @@ pub(crate) fn populate(
         }
         prepared.stateroot_var = true;
     }
-    for mount in mounts {
+    for mount in targets {
         let target = target_path(mount);
         let nested = children(mount, mounts);
         let target_dir = root
@@ -692,6 +738,107 @@ fn fresh_roots(root: &Dir, path: &Utf8Path) -> Result<Vec<Utf8PathBuf>> {
         roots.push(lost_found);
     }
     Ok(roots)
+}
+
+/// Implementation of `bootc state initialize-var`: on a booted system, fill
+/// the empty filesystems mounted at or below `scope` in /var from the booted
+/// deployment's image, like `install to-filesystem --initialize-var-mounts`
+/// does at installation.
+pub(crate) async fn initialize_booted(scope: &Utf8Path) -> Result<()> {
+    let resolved = scope
+        .canonicalize_utf8()
+        .with_context(|| format!("Resolving {scope}"))?;
+    let scope = resolved
+        .strip_prefix(Utf8Path::new("/").join(VAR))
+        .map_err(|_| anyhow::anyhow!("{resolved} is not in /var"))?;
+    // Every mount is a boundary; only block-device filesystems are filled.
+    let mounts = discover("/".into())?;
+    let eligible = discover_matching("/".into(), is_block_backed)?;
+    // Fail early, before setting up the image
+    scope_targets(scope, &mounts, &eligible)?;
+    let storage = crate::cli::get_storage().await?;
+    let source = match storage.kind()? {
+        crate::store::BootedStorageKind::Ostree(booted) => {
+            let deployment = booted.sysroot.deployment_dirpath(&booted.deployment);
+            let deployment = storage.physical_root_path.join(deployment.as_str());
+            let deployment_dir = Dir::open_ambient_dir(&deployment, ambient_authority())
+                .with_context(|| format!("Opening {deployment}"))?;
+            // Something mounted there would not be the image's /var.
+            if deployment_dir.is_mountpoint(VAR)? == Some(true) {
+                bail!("{deployment}/{VAR} is a mountpoint");
+            }
+            ImageVar::ostree(&deployment)
+        }
+        crate::store::BootedStorageKind::Composefs(booted) => ImageVar::composefs(
+            &storage.physical_root,
+            &booted.cmdline.digest,
+            booted.cmdline.allow_missing_fsverity,
+        )?,
+    };
+    let root = Dir::open_ambient_dir("/", ambient_authority())?;
+    let policy = if crate::lsm::selinux_enabled() {
+        crate::lsm::new_sepolicy_at(&root)?
+    } else {
+        None
+    };
+    let mut prepared = Prepared::default();
+    let populated = populate_scope(
+        &root,
+        "/".into(),
+        scope,
+        &mounts,
+        &eligible,
+        &source,
+        &mut prepared,
+    );
+    drop(source);
+    finish(&root, None, &prepared, policy.as_ref(), populated)
+}
+
+/// The filesystems among `eligible` (relative to /var, like all of
+/// `mounts`) at or below `scope`, or an error naming what is mounted there
+/// if none is.
+fn scope_targets(
+    scope: &Utf8Path,
+    mounts: &[Utf8PathBuf],
+    eligible: &[Utf8PathBuf],
+) -> Result<Vec<Utf8PathBuf>> {
+    let in_scope = |m: &&Utf8PathBuf| m.starts_with(scope);
+    let targets: Vec<_> = eligible.iter().filter(in_scope).cloned().collect();
+    if targets.is_empty() {
+        let scope = Utf8Path::new("/").join(target_path(scope));
+        let found: Vec<_> = mounts
+            .iter()
+            .filter(in_scope)
+            .map(|m| format!("/{}", target_path(m)))
+            .collect();
+        if found.is_empty() {
+            bail!("No filesystem is mounted at or below {scope}");
+        }
+        bail!(
+            "No filesystem that bootc initializes is mounted at or below {scope}, only {}: \
+             it initializes block-device filesystems mounted from their root",
+            found.join(", ")
+        );
+    }
+    Ok(targets)
+}
+
+/// Day two: fill the `eligible` filesystems at or below `scope` with
+/// [`populate_targets`], keeping all of `mounts` as boundaries: a tmpfs or
+/// network filesystem mounted below an empty volume is left alone, and
+/// doesn't make the volume count as holding data.
+fn populate_scope(
+    root: &Dir,
+    root_path: &Utf8Path,
+    scope: &Utf8Path,
+    mounts: &[Utf8PathBuf],
+    eligible: &[Utf8PathBuf],
+    source: &ImageVar,
+    prepared: &mut Prepared,
+) -> Result<()> {
+    let targets = scope_targets(scope, mounts, eligible)?;
+    populate_targets(root, root_path, None, mounts, &targets, source, prepared)
 }
 
 /// Flush the filesystem of a mount, surfacing writeback errors.
@@ -1277,9 +1424,69 @@ mod tests {
         collect(
             "/target with spaces/var".into(),
             &mounts.filesystems,
+            |_| true,
             &mut paths,
         );
         assert_eq!(paths, vec![Utf8PathBuf::from("opt"), "opt/app".into()]);
+        Ok(())
+    }
+
+    #[test]
+    fn day_two_targets() {
+        let mounts = paths(&["", "opt/app", "opt/app/cache", "srv/nfs"]);
+        let eligible = paths(&["", "opt/app"]);
+        let targets = |scope: &str| {
+            scope_targets(scope.into(), &mounts, &eligible).map_err(|e| e.to_string())
+        };
+        let ineligible = |scope: &str, found: &str| -> Result<Vec<Utf8PathBuf>, String> {
+            Err(format!(
+                "No filesystem that bootc initializes is mounted at or below {scope}, only \
+                 {found}: it initializes block-device filesystems mounted from their root"
+            ))
+        };
+        assert_eq!(targets(""), Ok(paths(&["", "opt/app"])));
+        assert_eq!(targets("opt"), Ok(paths(&["opt/app"])));
+        assert_eq!(targets("opt/app"), Ok(paths(&["opt/app"])));
+        assert_eq!(
+            targets("opt/app/cache"),
+            ineligible("/var/opt/app/cache", "/var/opt/app/cache")
+        );
+        assert_eq!(targets("srv"), ineligible("/var/srv", "/var/srv/nfs"));
+        assert_eq!(
+            targets("log"),
+            Err("No filesystem is mounted at or below /var/log".into())
+        );
+    }
+
+    #[test]
+    fn collect_block_backed() -> Result<()> {
+        // A booted system's /var: only block-backed filesystems are ours.
+        let mounts: bootc_mount::Findmnt = serde_json::from_value(serde_json::json!({
+            "filesystems": [{
+                "source": "/dev/vda4[/ostree/deploy/default/var]", "target": "/var",
+                "maj:min": "0:1", "fstype": "ext4", "options": "rw", "children": [
+                    {"source": "/dev/mapper/vg_data-app", "target": "/var/opt/app",
+                     "maj:min": "0:2", "fstype": "xfs", "options": "rw"},
+                    {"source": "shm", "target": "/var/lib/containers/storage/overlay-containers/x/userdata/shm",
+                     "maj:min": "0:3", "fstype": "tmpfs", "options": "rw"},
+                    {"source": "sunrpc", "target": "/var/lib/nfs/rpc_pipefs",
+                     "maj:min": "0:4", "fstype": "rpc_pipefs", "options": "rw"},
+                    {"source": "server:/export", "target": "/var/srv/nfs",
+                     "maj:min": "0:5", "fstype": "nfs4", "options": "rw"},
+                    {"source": "/dev/vda4[/ostree/deploy/default/var/lib/kubelet/x]",
+                     "target": "/var/lib/kubelet/pods/p/volume-subpaths/v",
+                     "maj:min": "0:1", "fstype": "ext4", "options": "rw"}
+                ]
+            }]
+        }))?;
+        let mut paths = Vec::new();
+        collect(
+            "/var".into(),
+            &mounts.filesystems,
+            is_block_backed,
+            &mut paths,
+        );
+        assert_eq!(paths, vec![Utf8PathBuf::new(), "opt/app".into()]);
         Ok(())
     }
 
@@ -1443,6 +1650,35 @@ mod tests {
                 &mut value[..],
             )?;
             assert_eq!(&value[..len], b"image");
+
+            // Day two: an empty volume with a foreign mount below it (a
+            // tmpfs, which isn't eligible) is filled around that mount, which
+            // is left alone.
+            root.create_dir_all("image/var/srv/vol/cache")?;
+            root.write("image/var/srv/vol/seed", "vol seed")?;
+            root.write("image/var/srv/vol/cache/x", "image cache")?;
+            root.create_dir_all("var/srv/vol")?;
+            tmpfs("var/srv/vol")?;
+            root.create_dir_all("var/srv/vol/cache")?;
+            tmpfs("var/srv/vol/cache")?;
+            root.write("var/srv/vol/cache/own", "foreign")?;
+            let mounts = discover(path)?;
+            assert_eq!(mounts, paths(&["opt/app", "srv/vol", "srv/vol/cache"]));
+            let eligible = paths(&["opt/app", "srv/vol"]);
+            let mut prepared = Prepared::default();
+            populate_scope(
+                &root,
+                path,
+                "srv".into(),
+                &mounts,
+                &eligible,
+                &image,
+                &mut prepared,
+            )?;
+            assert_eq!(prepared.mounts, paths(&["srv/vol"]));
+            assert_eq!(root.read_to_string("var/srv/vol/seed")?, "vol seed");
+            assert_eq!(root.read_to_string("var/srv/vol/cache/own")?, "foreign");
+            assert!(!root.try_exists("var/srv/vol/cache/x")?);
             Ok(())
         })();
         let unmount = bootc_mount::unmount_recursive(path);
