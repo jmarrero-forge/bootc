@@ -98,6 +98,14 @@ what is not on a mounted filesystem, and each empty mounted filesystem gets its
 part, so nothing is stored twice. With a filesystem mounted on `/var` itself,
 the state directory keeps only its marker.
 
+When a filesystem is mounted on `/var` itself, bootc also writes an empty
+`.bootc-var-mounts` file into the deployment's state directory for `/var`. On
+composefs it tells setup-root to leave `/var` to that filesystem's fstab entry
+instead of bind-mounting the state directory over it, as for `--defer-var`
+(see **bootc-setup-root-conf**(5)). An initramfs that predates this ignores the
+file: switching or rolling back to such an image bind-mounts the state
+directory, with the `/var` seeded at installation, over that filesystem.
+
 Tools can tell whether a bootc binary supports `--initialize-var-mounts` by
 looking for `initialize-var-mounts` in the `Features:` list of
 `bootc --version`.

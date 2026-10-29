@@ -83,12 +83,13 @@ Controls how `/var` is mounted from the deployment state directory.
     (see below) to get a fresh tmpfs on every boot.
 
   Without a `mount` (or `transient`) setting, `none` also applies to a system
-  installed with `bootc install --defer-var` (its stateroot `/var` holds
-  `.bootc-defer-var`) when the deployment's `/etc/fstab` has a mount entry for
-  `/var`, so that systemd mounts that filesystem there, like on ostree systems.
-  As in ostree, an entry with `noauto` counts too. Swap entries and lines with
-  fewer than three fields don't. An explicit `mount = "bind"` keeps the bind
-  mount.
+  installed with `bootc install --defer-var`, or with `--initialize-var-mounts`
+  onto a filesystem mounted on `/var` (its stateroot `/var` holds
+  `.bootc-defer-var` or `.bootc-var-mounts`), when the deployment's
+  `/etc/fstab` has a mount entry for `/var`, so that systemd mounts that
+  filesystem there, like on ostree systems. As in ostree, an entry with
+  `noauto` counts too. Swap entries and lines with fewer than three fields
+  don't. An explicit `mount = "bind"` keeps the bind mount.
 
 For a fresh, ephemeral `/var` on every boot (e.g. for stateless or kiosk
 systems), use the `systemd.volatile=state` kernel argument.  `bootc-root-setup`

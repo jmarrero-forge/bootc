@@ -525,6 +525,15 @@ const FSTAB: &str = "etc/fstab";
 /// the first deployment: the image's /var was not copied there.
 pub const DEFER_VAR_MARKER: &str = ".bootc-defer-var";
 
+/// Written into the stateroot's var by `bootc install
+/// --initialize-var-mounts` when a filesystem is mounted on /var itself:
+/// bootc filled (or left alone) that filesystem, which is /var at boot.
+pub const VAR_MOUNTS_MARKER: &str = ".bootc-var-mounts";
+
+/// The markers by which setup-root leaves a /var that the fstab mounts to
+/// systemd.
+const VAR_MARKERS: [&str; 2] = [DEFER_VAR_MARKER, VAR_MOUNTS_MARKER];
+
 /// Read the regular file at `path` below `root`, resolving symlinks (also
 /// absolute ones) within `root`, as the booted system will see it; `None`
 /// if there is none, or it isn't a regular file.
@@ -606,35 +615,40 @@ fn root_fstab_mounts_var(root: impl AsFd) -> bool {
 }
 
 /// Whether the deployment `state` directory's var (a symlink to the
-/// stateroot's) was deferred at installation. Errors count as no.
-fn var_deferred(state: impl AsFd) -> bool {
-    let marker = format!("var/{DEFER_VAR_MARKER}");
-    match rustix::fs::accessat(
-        state,
-        marker.as_str(),
-        rustix::fs::Access::EXISTS,
-        rustix::fs::AtFlags::empty(),
-    ) {
-        Ok(()) => true,
-        Err(Errno::NOENT) => false,
-        Err(e) => {
-            eprintln!("warning: checking for {marker}: {e}; assuming /var was not deferred");
-            false
+/// stateroot's) has one of [`VAR_MARKERS`], written at installation when
+/// the caller or bootc provides /var. Errors count as no.
+fn var_marked(state: impl AsFd) -> bool {
+    VAR_MARKERS.iter().any(|name| {
+        let marker = format!("var/{name}");
+        match rustix::fs::accessat(
+            &state,
+            marker.as_str(),
+            rustix::fs::Access::EXISTS,
+            rustix::fs::AtFlags::empty(),
+        ) {
+            Ok(()) => true,
+            Err(Errno::NOENT) => false,
+            Err(e) => {
+                eprintln!("warning: checking for {marker}: {e}; assuming it isn't there");
+                false
+            }
         }
-    }
+    })
 }
 
 /// Whether to leave /var to the fstab instead of bind-mounting the state's
 /// var over it: only without an explicit `[var]` setting, for a /var that
-/// `bootc install --defer-var` left to the caller (`deferred`), and when
-/// the fstab mounts /var (`fstab_mounts_var`). The checks run in that
-/// order, and only as far as needed.
+/// installation marked as provided (`marked`: by the caller with
+/// `--defer-var`, or by bootc on a /var filesystem with
+/// `--initialize-var-mounts`), and when the fstab mounts /var
+/// (`fstab_mounts_var`). The checks run in that order, and only as far as
+/// needed.
 fn leave_var_to_fstab(
     var: &MountConfig,
-    deferred: impl FnOnce() -> bool,
+    marked: impl FnOnce() -> bool,
     fstab_mounts_var: impl FnOnce() -> bool,
 ) -> bool {
-    var.mount.is_none() && !var.transient && deferred() && fstab_mounts_var()
+    var.mount.is_none() && !var.transient && marked() && fstab_mounts_var()
 }
 
 /// The `[var]` configuration to mount /var with: `var` as configured, or
@@ -642,13 +656,9 @@ fn leave_var_to_fstab(
 /// `state` directory and the fstab of `root`, the root as it will be after
 /// switch-root (with /etc mounted).
 fn var_config(var: MountConfig, state: impl AsFd, root: impl AsFd) -> MountConfig {
-    if leave_var_to_fstab(
-        &var,
-        || var_deferred(&state),
-        || root_fstab_mounts_var(&root),
-    ) {
+    if leave_var_to_fstab(&var, || var_marked(&state), || root_fstab_mounts_var(&root)) {
         eprintln!(
-            "/var was deferred at installation and /etc/fstab mounts it: not bind-mounting the deployment state's var"
+            "/var was provided at installation and /etc/fstab mounts it: not bind-mounting the deployment state's var"
         );
         MountConfig {
             mount: Some(MountType::None),
@@ -797,13 +807,13 @@ pub fn setup_root(args: Args) -> Result<()> {
     // as an empty directory from the composefs image for systemd to fill.
     //
     // So does an fstab entry for /var on a system installed with
-    // --defer-var, like in ostree's generator: binding the state
-    // directory's var over it would make systemd consider /var mounted, and
-    // the filesystem would go unused. Other systems keep the bind mount, as
-    // they had it before. An explicit [var] setting wins. The fstab is read
-    // through the /etc mounted above, so that an overlay's whiteouts, opaque
-    // directories and metadata-only copy-ups count as they will after
-    // switch-root.
+    // --defer-var, or with --initialize-var-mounts onto a /var filesystem,
+    // like in ostree's generator: binding the state directory's var over it
+    // would make systemd consider /var mounted, and the filesystem would go
+    // unused. Other systems keep the bind mount, as they had it before. An
+    // explicit [var] setting wins. The fstab is read through the /etc mounted
+    // above, so that an overlay's whiteouts, opaque directories and
+    // metadata-only copy-ups count as they will after switch-root.
     let var = var_config(config.var, &state, visible_root);
     mount_subdir(visible_root, &state, "var", var, MountType::Bind)?;
 
@@ -948,19 +958,28 @@ mod tests {
     }
 
     #[test]
-    fn test_var_deferred() -> Result<()> {
+    fn test_var_marked() -> Result<()> {
         use cap_std_ext::cap_std::ambient_authority;
         use cap_std_ext::cap_tempfile::TempDir;
         // A deployment state directory's var is a relative symlink to the
         // stateroot's, as write_composefs_state() makes it
-        let td = TempDir::new(ambient_authority())?;
-        td.create_dir_all("state/os/default/var")?;
-        td.create_dir_all("state/deploy/abc")?;
-        td.symlink("../../os/default/var", "state/deploy/abc/var")?;
-        let state = td.open_dir("state/deploy/abc")?;
-        assert!(!var_deferred(&state));
-        td.write(format!("state/os/default/var/{DEFER_VAR_MARKER}"), "")?;
-        assert!(var_deferred(&state));
+        for (markers, expected) in [
+            (&[][..], false),
+            (&[DEFER_VAR_MARKER][..], true),
+            (&[VAR_MOUNTS_MARKER][..], true),
+            (&[DEFER_VAR_MARKER, VAR_MOUNTS_MARKER][..], true),
+            (&[".ostree-selabeled"][..], false),
+        ] {
+            let td = TempDir::new(ambient_authority())?;
+            td.create_dir_all("state/os/default/var")?;
+            td.create_dir_all("state/deploy/abc")?;
+            td.symlink("../../os/default/var", "state/deploy/abc/var")?;
+            for marker in markers {
+                td.write(format!("state/os/default/var/{marker}"), "")?;
+            }
+            let state = td.open_dir("state/deploy/abc")?;
+            assert_eq!(var_marked(&state), expected, "{markers:?}");
+        }
         Ok(())
     }
 
@@ -971,18 +990,24 @@ mod tests {
         const VAR_FSTAB: &str = "UUID=v /var ext4 defaults 0 0\n";
         // (marker, fstab mounts /var, [var] config, expected mount)
         let cases = [
-            (true, true, None, Some(MountType::None)),
-            (true, false, None, None),
-            (false, true, None, None),
-            (true, true, Some(MountType::Bind), Some(MountType::Bind)),
+            (Some(DEFER_VAR_MARKER), true, None, Some(MountType::None)),
+            (Some(VAR_MOUNTS_MARKER), true, None, Some(MountType::None)),
+            (Some(DEFER_VAR_MARKER), false, None, None),
+            (None, true, None, None),
+            (
+                Some(VAR_MOUNTS_MARKER),
+                true,
+                Some(MountType::Bind),
+                Some(MountType::Bind),
+            ),
         ];
         for (marker, fstab, mount, expected) in cases {
             let td = TempDir::new(ambient_authority())?;
             td.create_dir_all("state/os/default/var")?;
             td.create_dir_all("state/deploy/abc")?;
             td.symlink("../../os/default/var", "state/deploy/abc/var")?;
-            if marker {
-                td.write(format!("state/os/default/var/{DEFER_VAR_MARKER}"), "")?;
+            if let Some(marker) = marker {
+                td.write(format!("state/os/default/var/{marker}"), "")?;
             }
             td.create_dir_all("root/etc")?;
             if fstab {
@@ -993,7 +1018,7 @@ mod tests {
                 transient: false,
             };
             let got = var_config(var, td.open_dir("state/deploy/abc")?, td.open_dir("root")?);
-            assert_eq!(got.mount, expected, "{marker} {fstab} {mount:?}");
+            assert_eq!(got.mount, expected, "{marker:?} {fstab} {mount:?}");
             assert!(!got.transient);
         }
         Ok(())
@@ -1003,7 +1028,7 @@ mod tests {
     fn test_leave_var_to_fstab() {
         use MountType::{Bind, Overlay};
         let config = |mount, transient| MountConfig { mount, transient };
-        // (config, deferred, fstab mounts /var, expected)
+        // (config, /var marked as provided, fstab mounts /var, expected)
         let cases = [
             // An explicit [var] setting wins, whatever the rest
             (config(Some(Bind), false), true, true, false),
@@ -1011,21 +1036,22 @@ mod tests {
             (config(Some(Overlay), false), true, true, false),
             // So does transient
             (config(None, true), true, true, false),
-            // Deferred, and fstab mounts /var: leave it to fstab
+            // Marked (--defer-var, or --initialize-var-mounts onto a /var
+            // filesystem), and fstab mounts /var: leave it to fstab
             (config(None, false), true, true, true),
             // Otherwise keep the bind mount
             (config(None, false), false, true, false),
             (config(None, false), true, false, false),
             (config(None, false), false, false, false),
         ];
-        for (var, deferred, fstab, expected) in cases {
+        for (var, marked, fstab, expected) in cases {
             assert_eq!(
-                leave_var_to_fstab(&var, || deferred, || fstab),
+                leave_var_to_fstab(&var, || marked, || fstab),
                 expected,
-                "{var:?} {deferred} {fstab}"
+                "{var:?} {marked} {fstab}"
             );
         }
-        // The fstab is only read for a deferred /var without a [var] setting
+        // The fstab is only read for a marked /var without a [var] setting
         let never = || -> bool { panic!("checked needlessly") };
         assert!(!leave_var_to_fstab(
             &config(Some(Bind), false),
