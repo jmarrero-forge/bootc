@@ -11,7 +11,10 @@ use bootc_mount::tempmount::TempMount;
 use bootc_utils::CommandRunExt;
 use camino::{Utf8Path, Utf8PathBuf};
 use cap_std_ext::{
-    cap_std::{ambient_authority, fs::Dir},
+    cap_std::{
+        ambient_authority,
+        fs::{Dir, Permissions, PermissionsExt as _},
+    },
     dirext::CapStdExtDirExt,
 };
 use libsystemd::logging::Priority;
@@ -35,6 +38,39 @@ const VAR: &str = "var";
 /// Journal message ID of the events of initializing /var filesystems from
 /// the image: filled, skipped because they hold data, or failed.
 const VAR_INIT_JOURNAL_ID: &str = "a3dbd7d2ce1341feb6f6003a98eb6657";
+
+/// Marks a stateroot var whose /var at boot is a filesystem that
+/// `--initialize-var-mounts` found mounted on the target's /var: composefs
+/// setup-root then leaves /var to that filesystem's fstab entry instead of
+/// bind-mounting the stateroot var over it. See
+/// [`bootc_initramfs_setup::VAR_MOUNTS_MARKER`].
+pub(crate) const VAR_MOUNTS_MARKER: &str = bootc_initramfs_setup::VAR_MOUNTS_MARKER;
+
+/// Write [`VAR_MOUNTS_MARKER`] into the stateroot var at `var` (relative to
+/// `root`), labeled as /var's, when `mounts` (relative to /var) include a
+/// filesystem on /var itself, whether it gets filled or holds data already.
+pub(crate) fn mark_var_filesystem(
+    root: &Dir,
+    var: &Utf8Path,
+    mounts: &[Utf8PathBuf],
+    policy: Option<&ostree::SePolicy>,
+) -> Result<()> {
+    if !mounts.iter().any(|m| m.as_str().is_empty()) {
+        return Ok(());
+    }
+    let dir = root
+        .open_dir(var)
+        .with_context(|| format!("Opening {var}"))?;
+    dir.atomic_write_with_perms(VAR_MOUNTS_MARKER, b"", Permissions::from_mode(0o644))
+        .with_context(|| format!("Writing {var}/{VAR_MOUNTS_MARKER}"))?;
+    if let Some(policy) = policy {
+        let path = Utf8Path::new("/var").join(VAR_MOUNTS_MARKER);
+        let label = crate::lsm::require_label(policy, &path, libc::S_IFREG | 0o644)?;
+        crate::lsm::set_security_selinux_path(&dir, VAR_MOUNTS_MARKER.into(), label.as_bytes())
+            .with_context(|| format!("SELinux labeling of {var}/{VAR_MOUNTS_MARKER}"))?;
+    }
+    Ok(())
+}
 
 /// The path of a mount (relative to /var) from the installation root.
 pub(crate) fn target_path(mount: &Utf8Path) -> Utf8PathBuf {
@@ -1428,6 +1464,24 @@ mod tests {
             &mut paths,
         );
         assert_eq!(paths, vec![Utf8PathBuf::from("opt"), "opt/app".into()]);
+        Ok(())
+    }
+
+    #[test]
+    fn var_filesystem_marker() -> Result<()> {
+        // Only a filesystem on /var itself gets the stateroot var marked
+        for (mounts, marked) in [
+            (&[][..], false),
+            (&["opt/app"][..], false),
+            (&[""][..], true),
+            (&["", "opt/app"][..], true),
+        ] {
+            let root = TempDir::new(ambient_authority())?;
+            root.create_dir_all("state/var")?;
+            mark_var_filesystem(&root, "state/var".into(), &paths(mounts), None)?;
+            let marker = Utf8Path::new("state/var").join(VAR_MOUNTS_MARKER);
+            assert_eq!(root.try_exists(&marker)?, marked, "{mounts:?}");
+        }
         Ok(())
     }
 

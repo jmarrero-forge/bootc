@@ -2437,6 +2437,16 @@ async fn install_to_filesystem_impl(
     // while all nested mounts are still visible, before labeling and
     // finalizing the installation.
     let policy = state.load_policy()?;
+    // On composefs, a filesystem mounted on /var is /var at boot only when
+    // setup-root leaves /var to fstab, which it does with this marker.
+    if let Some(mounts) = var_mounts {
+        var_mounts::mark_var_filesystem(
+            &rootfs.physical_root,
+            &stateroot_var,
+            mounts,
+            policy.as_ref(),
+        )?;
+    }
     let mut prepared_var = var_mounts::Prepared::default();
     let populated = match image_var {
         Some(image_var) => var_mounts::populate(
