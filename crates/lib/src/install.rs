@@ -147,6 +147,7 @@ pub(crate) mod config;
 pub(crate) mod defer_var;
 mod osbuild;
 pub(crate) mod osconfig;
+pub(crate) mod var_mounts;
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -226,7 +227,11 @@ pub(crate) const DESTRUCTIVE_CLEANUP: &str = "etc/bootc-destructive-cleanup";
 /// This is an ext4 special directory we need to ignore.
 const LOST_AND_FOUND: &str = "lost+found";
 /// Optional features of this binary, listed by `bootc --version`.
-pub(crate) const FEATURES: &[&str] = &[defer_var::FEATURE];
+pub(crate) const FEATURES: &[&str] = &[
+    defer_var::FEATURE,
+    var_mounts::FEATURE,
+    var_mounts::STATE_FEATURE,
+];
 /// The mount path for selinux
 const SELINUXFS: &str = "/sys/fs/selinux";
 /// The mount path for uefi
@@ -596,10 +601,20 @@ pub(crate) struct InstallTargetFilesystemOpts {
 
     /// Do not seed the deployment's state directory with the image's /var.
     ///
-    /// The installed system then starts with an empty /var, for the caller
-    /// to fill, e.g. on a separate filesystem.
+    /// With --initialize-var-mounts, bootc then copies the image's /var into
+    /// /var as it will be at boot, so that content below a mounted filesystem
+    /// is stored only there. Without it, the installed system starts with an
+    /// empty /var, for the caller to fill.
     #[clap(long)]
     pub(crate) defer_var: bool,
+
+    /// Initialize empty filesystems mounted at or below /var in the target
+    /// from the image's /var, including nested mounts.
+    ///
+    /// Without this, filesystems that the caller mounted there are left alone,
+    /// and hide the image's /var content at boot.
+    #[clap(long)]
+    pub(crate) initialize_var_mounts: bool,
 
     /// Initialize the system in-place; at the moment, only one mode for this is implemented.
     /// In the future, it may also be supported to set up an explicit "dual boot" system.
@@ -2264,6 +2279,7 @@ async fn install_to_filesystem_impl(
     state: &State,
     rootfs: &mut RootSetup,
     cleanup: Cleanup,
+    var_mounts: Option<&[Utf8PathBuf]>,
 ) -> Result<()> {
     if matches!(state.selinux_state, SELinuxFinalState::ForceTargetDisabled) {
         rootfs.kargs.extend(&Cmdline::from("selinux=0"));
@@ -2286,6 +2302,16 @@ async fn install_to_filesystem_impl(
         }
     }
 
+    // The image's /var, to initialize the caller's /var filesystems (and a
+    // deferred stateroot var) from.
+    let initialize_var = var_mounts.is_some_and(|m| !m.is_empty() || rootfs.defer_var);
+    let stateroot_var = if state.composefs_options.composefs_backend {
+        Utf8PathBuf::from(crate::composefs_consts::SHARED_VAR_PATH)
+    } else {
+        Utf8PathBuf::from(format!("ostree/deploy/{}/var", state.stateroot()))
+    };
+    let deferred_var = rootfs.defer_var.then_some(stateroot_var.as_path());
+    let mut image_var = None;
     if state.composefs_options.composefs_backend {
         let fetch_ref = state.source.composefs_fetch_reference();
         let (manifest, _) = get_container_manifest_and_config(&fetch_ref).await?;
@@ -2352,6 +2378,17 @@ async fn install_to_filesystem_impl(
             )?;
         }
         setup_composefs_boot(rootfs, state, &pull_result, allow_missing_verity).await?;
+        if initialize_var {
+            let deployments = rootfs
+                .physical_root
+                .open_dir(crate::composefs_consts::STATE_DIR_RELATIVE)?;
+            let id = var_mounts::only_dir(&deployments).context("Finding the deployment")?;
+            image_var = Some(var_mounts::ImageVar::composefs(
+                &rootfs.physical_root,
+                &id,
+                allow_missing_verity,
+            )?);
+        }
 
         // Label composefs objects as /usr so they get usr_t rather than
         // default_t (which has no policy match).
@@ -2367,6 +2404,14 @@ async fn install_to_filesystem_impl(
         }
     } else {
         ostree_install(state, rootfs, cleanup).await?;
+        if initialize_var {
+            let deployments = format!("ostree/deploy/{}/deploy", state.stateroot());
+            let deployment = var_mounts::only_dir(&rootfs.physical_root.open_dir(&deployments)?)
+                .context("Finding the deployment")?;
+            image_var = Some(var_mounts::ImageVar::ostree(
+                &rootfs.physical_root_path.join(deployments).join(deployment),
+            ));
+        }
 
         // For s390x, we set zipl as the bootloader
         // this needs to be done after the ostree commit is deployed,
@@ -2387,13 +2432,54 @@ async fn install_to_filesystem_impl(
         }
     }
 
+    // The deployment backend seeds its own state directory, not the caller's
+    // mounted /var tree. Populate fresh external filesystems from the image
+    // while all nested mounts are still visible, before labeling and
+    // finalizing the installation.
+    let policy = state.load_policy()?;
+    // On composefs, a filesystem mounted on /var is /var at boot only when
+    // setup-root leaves /var to fstab, which it does with this marker.
+    if let Some(mounts) = var_mounts {
+        var_mounts::mark_var_filesystem(
+            &rootfs.physical_root,
+            &stateroot_var,
+            mounts,
+            policy.as_ref(),
+        )?;
+    }
+    let mut prepared_var = var_mounts::Prepared::default();
+    let populated = match image_var {
+        Some(image_var) => var_mounts::populate(
+            &rootfs.physical_root,
+            &rootfs.physical_root_path,
+            deferred_var,
+            var_mounts.unwrap_or_default(),
+            &image_var,
+            &mut prepared_var,
+        ),
+        None => Ok(()),
+    };
+    // Label each newly prepared filesystem by its deployed /var path (the
+    // physical-root walk below skips mountpoints), and flush them, surfacing
+    // any writeback errors, before anything else can fail. Unlike root and
+    // boot they are not remounted read-only or frozen: they may be bind
+    // mounts or lack freeze support, and callers may add content. Then
+    // report a failed copy.
+    var_mounts::finish(
+        &rootfs.physical_root,
+        deferred_var,
+        &prepared_var,
+        policy.as_ref(),
+        populated,
+    )?;
+
     // As the very last step before filesystem finalization, do a full SELinux
     // relabel of the physical root filesystem.  Any files that are already
     // labeled (e.g. ostree deployment contents, composefs objects) are skipped.
-    if let Some(policy) = state.load_policy()? {
+    if let Some(policy) = &policy {
         tracing::info!("Performing final SELinux relabeling of physical root");
         let mut path = Utf8PathBuf::from("");
-        crate::lsm::ensure_dir_labeled_recurse(&rootfs.physical_root, &mut path, &policy, None)
+        crate::lsm::ensure_dir_labeled_recurse(&rootfs.physical_root, &mut path, policy, None)
             .context("Final SELinux relabeling of physical root")?;
     } else {
         tracing::debug!("Skipping final SELinux relabel (SELinux is disabled)");
@@ -2489,7 +2575,7 @@ pub(crate) async fn install_to_disk(mut opts: InstallToDiskOpts) -> Result<()> {
         (rootfs, loopback_dev)
     };
 
-    install_to_filesystem_impl(&state, &mut rootfs, Cleanup::Skip).await?;
+    install_to_filesystem_impl(&state, &mut rootfs, Cleanup::Skip, None).await?;
 
     // Drop all data about the root except the bits we need to ensure any file descriptors etc. are closed.
     let (root_path, luksdev) = rootfs.into_storage();
@@ -2759,21 +2845,26 @@ pub enum Cleanup {
     TriggerOnNextBoot,
 }
 
-/// Reinstalling over or alongside an existing OS must not defer its live
-/// /var. Checked before anything on the target is changed.
-fn check_defer_var(
+/// Reinstalling over or alongside an existing OS must not initialize or defer
+/// its live /var. Checked before anything on the target is changed.
+fn check_var_options(
+    initialize_var_mounts: bool,
     defer_var: bool,
     targeting_host_root: bool,
     is_already_ostree: bool,
     replace: Option<ReplaceMode>,
 ) -> Result<()> {
-    anyhow::ensure!(
-        !defer_var
-            || !(targeting_host_root
-                || is_already_ostree
-                || replace == Some(ReplaceMode::Alongside)),
-        "--defer-var is not supported over an existing ostree system or with --replace=alongside"
-    );
+    let existing =
+        targeting_host_root || is_already_ostree || replace == Some(ReplaceMode::Alongside);
+    for (set, flag) in [
+        (initialize_var_mounts, "--initialize-var-mounts"),
+        (defer_var, "--defer-var"),
+    ] {
+        anyhow::ensure!(
+            !(set && existing),
+            "{flag} is not supported over an existing ostree system or with --replace=alongside"
+        );
+    }
     Ok(())
 }
 
@@ -2859,7 +2950,8 @@ pub(crate) async fn install_to_filesystem(
         );
         fsopts.root_path = possible_physical_root;
     };
-    check_defer_var(
+    check_var_options(
+        fsopts.initialize_var_mounts,
         fsopts.defer_var,
         targeting_host_root,
         is_already_ostree,
@@ -3064,7 +3156,11 @@ pub(crate) async fn install_to_filesystem(
         defer_var: fsopts.defer_var,
     };
 
-    install_to_filesystem_impl(&state, &mut rootfs, cleanup).await?;
+    let var_mounts = fsopts
+        .initialize_var_mounts
+        .then(|| var_mounts::discover(&rootfs.physical_root_path))
+        .transpose()?;
+    install_to_filesystem_impl(&state, &mut rootfs, cleanup, var_mounts.as_deref()).await?;
 
     // Drop all data about the root except the path to ensure any file descriptors etc. are closed.
     drop(rootfs);
@@ -3110,6 +3206,7 @@ pub(crate) async fn install_to_existing_root(opts: InstallToExistingRootOpts) ->
             root_mount_spec: None,
             boot_mount_spec: None,
             defer_var: false,
+            initialize_var_mounts: false,
             replace: opts.replace,
             skip_finalize: true,
             acknowledge_destructive: opts.acknowledge_destructive,
@@ -3304,30 +3401,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_check_defer_var() {
-        use ReplaceMode::*;
-        // (defer, host root, already ostree, replace, allowed)
-        let cases = [
-            (false, true, true, Some(Alongside), true),
-            (true, false, false, None, true),
-            (true, false, false, Some(Wipe), true),
-            (true, false, false, Some(Alongside), false),
-            (true, false, true, None, false),
-            (true, true, false, None, false),
-        ];
-        for (defer, host_root, ostree, replace, allowed) in cases {
-            let r = check_defer_var(defer, host_root, ostree, replace);
-            assert_eq!(
-                r.err().map(|e| e.to_string()),
-                (!allowed).then(|| "--defer-var is not supported over an existing ostree \
-                     system or with --replace=alongside"
-                    .to_owned()),
-                "{defer} {host_root} {ostree} {replace:?}"
-            );
-        }
-    }
-
-    #[test]
     fn test_composefs_opts_validate() {
         let addon = || Some(vec!["addon".to_string()]);
         // (composefs_backend, allow_missing_verity, uki_addon, bootloader, stateroot, valid)
@@ -3472,6 +3545,55 @@ mod tests {
             let original = original.parse().unwrap();
             let fetched = composefs_fetch_reference(&original, config_id);
             assert_eq!(fetched.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn test_check_var_options() {
+        use ReplaceMode::*;
+        // (initialize, defer, host root, already ostree, replace, the flag refused)
+        let cases = [
+            (false, false, true, true, Some(Alongside), None),
+            (true, true, false, false, None, None),
+            (true, false, false, false, Some(Wipe), None),
+            (false, true, false, false, Some(Wipe), None),
+            (
+                true,
+                false,
+                false,
+                false,
+                Some(Alongside),
+                Some("--initialize-var-mounts"),
+            ),
+            (
+                true,
+                true,
+                false,
+                true,
+                None,
+                Some("--initialize-var-mounts"),
+            ),
+            (false, true, false, true, None, Some("--defer-var")),
+            (false, true, true, false, None, Some("--defer-var")),
+            (
+                true,
+                false,
+                true,
+                false,
+                None,
+                Some("--initialize-var-mounts"),
+            ),
+        ];
+        for (init, defer, host_root, ostree, replace, refused) in cases {
+            let r = check_var_options(init, defer, host_root, ostree, replace);
+            assert_eq!(
+                r.err().map(|e| e.to_string()),
+                refused.map(|flag| format!(
+                    "{flag} is not supported over an existing ostree system or with \
+                     --replace=alongside"
+                )),
+                "{init} {defer} {host_root} {ostree} {replace:?}"
+            );
         }
     }
 

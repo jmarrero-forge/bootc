@@ -1028,6 +1028,19 @@ const LOADER_ENTRIES_SUBCOMMAND: &str = "loader-entries";
 pub(crate) enum StateOpts {
     /// Remove all ostree deployments from this system
     WipeOstree,
+    /// Initialize empty filesystems in /var from the booted image's /var.
+    ///
+    /// Each empty block-device filesystem mounted at or below PATH gets its
+    /// part of the image's /var, as with `install to-filesystem
+    /// --initialize-var-mounts`: for example a volume added after
+    /// installation. Filesystems that already hold data, and other mounts
+    /// such as tmpfs, are left alone. That includes a filesystem that a
+    /// failed copy left partly filled: empty it to have it initialized.
+    InitializeVar {
+        /// Only initialize filesystems mounted at or below this path.
+        #[clap(default_value = "/var")]
+        path: Utf8PathBuf,
+    },
 }
 
 impl InternalsOpts {
@@ -2898,6 +2911,9 @@ async fn run_from_opt(opt: Opt) -> Result<CliExitStatus> {
                 crate::deploy::wipe_ostree(sysroot).await?;
                 Ok(())
             }
+            StateOpts::InitializeVar { path } => {
+                crate::install::var_mounts::initialize_booted(&path).await
+            }
         },
 
         Opt::ComposefsFinalizeStaged(opts) => {
@@ -3405,6 +3421,22 @@ mod tests {
                 .unwrap();
                 assert!(matches!(opt, Opt::LoaderEntries(_)));
             }
+        }
+    }
+
+    #[test]
+    fn test_parse_state_initialize_var() {
+        for (args, path) in [
+            (&["bootc", "state", "initialize-var"][..], "/var"),
+            (
+                &["bootc", "state", "initialize-var", "/var/opt/app"],
+                "/var/opt/app",
+            ),
+        ] {
+            assert_eq!(
+                Opt::try_parse_from(args).unwrap(),
+                Opt::State(StateOpts::InitializeVar { path: path.into() })
+            );
         }
     }
 
