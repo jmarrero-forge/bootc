@@ -27,7 +27,7 @@ use crate::{
             setup_composefs_uki_boot,
         },
         gc::composefs_gc,
-        repo::pull_composefs_repo,
+        repo::{PullRepoResult, pull_composefs_repo},
         service::start_finalize_stated_svc,
         soft_reboot::prepare_soft_reboot_composefs,
         state::{write_composefs_state, write_staged_deployment},
@@ -331,14 +331,7 @@ pub(crate) async fn do_upgrade(
 
     start_finalize_stated_svc()?;
 
-    let crate::bootc_composefs::repo::PullRepoResult {
-        repo,
-        entries,
-        id,
-        boot_ids,
-        manifest_digest,
-        fs: oci_fs,
-    } = pull_composefs_repo(
+    let pulled = pull_composefs_repo(
         imgref,
         opts.delta,
         booted_cfs.cmdline.allow_missing_fsverity,
@@ -353,11 +346,36 @@ pub(crate) async fn do_upgrade(
     if let Some(delta) = opts.delta {
         let expected = delta.target_manifest_digest().to_string();
         anyhow::ensure!(
-            manifest_digest == expected,
-            "Delta {} imported manifest {manifest_digest}, but it records {expected} as its target",
+            pulled.manifest_digest == expected,
+            "Delta {} imported manifest {}, but it records {expected} as its target",
             delta.path,
+            pulled.manifest_digest,
         );
     }
+
+    deploy_pulled(storage, booted_cfs, host, imgref, opts, pulled).await
+}
+
+/// Deploys an image that is in the composefs repository: checks it against
+/// the existing deployments, sets up its boot entry and state, stages it,
+/// and runs the repository GC.
+#[context("Deploying image")]
+pub(crate) async fn deploy_pulled(
+    storage: &Storage,
+    booted_cfs: &BootedComposefs,
+    host: &Host,
+    imgref: &ImageReference,
+    opts: &DoUpgradeOpts<'_>,
+    pulled: PullRepoResult,
+) -> Result<()> {
+    let PullRepoResult {
+        repo,
+        entries,
+        id,
+        boot_ids,
+        manifest_digest,
+        fs: oci_fs,
+    } = pulled;
 
     // If the target image produces the same fs-verity digest as any existing
     // deployment (booted, staged, rollback, or pinned), error out.  Two images
