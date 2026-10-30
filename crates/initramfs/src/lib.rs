@@ -518,6 +518,147 @@ pub fn gpt_workaround() -> Result<()> {
     }
 }
 
+/// The fstab, relative to the root.
+const FSTAB: &str = "etc/fstab";
+
+/// Written into the stateroot's var by `bootc install --defer-var`, before
+/// the first deployment: the image's /var was not copied there.
+pub const DEFER_VAR_MARKER: &str = ".bootc-defer-var";
+
+/// Read the regular file at `path` below `root`, resolving symlinks (also
+/// absolute ones) within `root`, as the booted system will see it; `None`
+/// if there is none, or it isn't a regular file.
+fn read_in_root(root: impl AsFd, path: &str) -> Result<Option<Vec<u8>>> {
+    use rustix::fs::{FileType, ResolveFlags, openat2};
+    use std::io::Read;
+    /// openat2(2) fails with EAGAIN when a concurrent rename might have let
+    /// `..` escape the root; it suggests retrying.
+    const ATTEMPTS: usize = 5;
+    let open = || {
+        openat2(
+            &root,
+            path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+            ResolveFlags::IN_ROOT,
+        )
+    };
+    let mut opened = open();
+    for _ in 1..ATTEMPTS {
+        if !matches!(opened, Err(Errno::AGAIN)) {
+            break;
+        }
+        opened = open();
+    }
+    let fd = match opened {
+        Ok(fd) => fd,
+        Err(Errno::NOENT | Errno::NOTDIR | Errno::NXIO | Errno::NODEV) => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("Opening /{path}")),
+    };
+    let st = rustix::fs::fstat(&fd).with_context(|| format!("Querying /{path}"))?;
+    if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
+        return Ok(None);
+    }
+    let mut content = Vec::new();
+    std::fs::File::from(fd)
+        .read_to_end(&mut content)
+        .with_context(|| format!("Reading /{path}"))?;
+    Ok(Some(content))
+}
+
+/// Whether an fstab has a mount entry for /var, as systemd would mount
+/// it: like libmount, only lines with at least a source, a mountpoint and
+/// a filesystem type are entries, and swap entries don't mount anything.
+/// Like ostree's system generator in `fstab_has_mount_entry()` (through
+/// glibc's getmntent), fields are separated by spaces and tabs, and mount
+/// options don't matter: `noauto` still counts.
+fn fstab_mounts_var(fstab: &str) -> bool {
+    fstab
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split([' ', '\t']).filter(|f| !f.is_empty());
+            let spec = fields.next()?;
+            if spec.starts_with('#') {
+                return None;
+            }
+            Some((fields.next()?, fields.next()?))
+        })
+        .any(|(file, vfstype)| {
+            vfstype != "swap"
+                && file.starts_with('/')
+                && file.split('/').filter(|p| !p.is_empty()).eq(["var"])
+        })
+}
+
+/// Whether the fstab below `root` has a mount entry for /var. This runs on
+/// every composefs boot, which must not fail over the fstab: it is read as
+/// bytes and decoded lossily (the paths compared are ASCII), and when it
+/// can't be read, the default /var bind mount is kept, with a warning.
+fn root_fstab_mounts_var(root: impl AsFd) -> bool {
+    match read_in_root(root, FSTAB) {
+        Ok(fstab) => fstab.is_some_and(|f| fstab_mounts_var(&String::from_utf8_lossy(&f))),
+        Err(e) => {
+            // No tracing subscriber in the initramfs; stderr reaches the journal.
+            eprintln!("warning: {e:#}; bind-mounting /var from the deployment state");
+            false
+        }
+    }
+}
+
+/// Whether the deployment `state` directory's var (a symlink to the
+/// stateroot's) was deferred at installation. Errors count as no.
+fn var_deferred(state: impl AsFd) -> bool {
+    let marker = format!("var/{DEFER_VAR_MARKER}");
+    match rustix::fs::accessat(
+        state,
+        marker.as_str(),
+        rustix::fs::Access::EXISTS,
+        rustix::fs::AtFlags::empty(),
+    ) {
+        Ok(()) => true,
+        Err(Errno::NOENT) => false,
+        Err(e) => {
+            eprintln!("warning: checking for {marker}: {e}; assuming /var was not deferred");
+            false
+        }
+    }
+}
+
+/// Whether to leave /var to the fstab instead of bind-mounting the state's
+/// var over it: only without an explicit `[var]` setting, for a /var that
+/// `bootc install --defer-var` left to the caller (`deferred`), and when
+/// the fstab mounts /var (`fstab_mounts_var`). The checks run in that
+/// order, and only as far as needed.
+fn leave_var_to_fstab(
+    var: &MountConfig,
+    deferred: impl FnOnce() -> bool,
+    fstab_mounts_var: impl FnOnce() -> bool,
+) -> bool {
+    var.mount.is_none() && !var.transient && deferred() && fstab_mounts_var()
+}
+
+/// The `[var]` configuration to mount /var with: `var` as configured, or
+/// `mount = "none"` when [`leave_var_to_fstab`] says so for the deployment
+/// `state` directory and the fstab of `root`, the root as it will be after
+/// switch-root (with /etc mounted).
+fn var_config(var: MountConfig, state: impl AsFd, root: impl AsFd) -> MountConfig {
+    if leave_var_to_fstab(
+        &var,
+        || var_deferred(&state),
+        || root_fstab_mounts_var(&root),
+    ) {
+        eprintln!(
+            "/var was deferred at installation and /etc/fstab mounts it: not bind-mounting the deployment state's var"
+        );
+        MountConfig {
+            mount: Some(MountType::None),
+            ..var
+        }
+    } else {
+        var
+    }
+}
+
 /// Sets up /sysroot for switch-root
 #[context("Setting up /sysroot")]
 pub fn setup_root(args: Args) -> Result<()> {
@@ -654,7 +795,17 @@ pub fn setup_root(args: Args) -> Result<()> {
     // [var] mount = "none" in setup-root-conf.toml) can change this to
     // MountType::None, which skips the bind-mount entirely and leaves /var
     // as an empty directory from the composefs image for systemd to fill.
-    mount_subdir(visible_root, &state, "var", config.var, MountType::Bind)?;
+    //
+    // So does an fstab entry for /var on a system installed with
+    // --defer-var, like in ostree's generator: binding the state
+    // directory's var over it would make systemd consider /var mounted, and
+    // the filesystem would go unused. Other systems keep the bind mount, as
+    // they had it before. An explicit [var] setting wins. The fstab is read
+    // through the /etc mounted above, so that an overlay's whiteouts, opaque
+    // directories and metadata-only copy-ups count as they will after
+    // switch-root.
+    let var = var_config(config.var, &state, visible_root);
+    mount_subdir(visible_root, &state, "var", var, MountType::Bind)?;
 
     if cfg!(not(feature = "pre-6.15")) {
         // Replace the /sysroot with the new composed root filesystem.
@@ -673,6 +824,215 @@ mod tests {
 
     fn parse(toml: &str) -> Config {
         toml::from_str(toml).expect("TOML parse failed")
+    }
+
+    #[test]
+    fn test_read_in_root() -> Result<()> {
+        use cap_std_ext::cap_std::ambient_authority;
+        use cap_std_ext::cap_tempfile::TempDir;
+        const TEXT: &[u8] = b"UUID=v /var ext4 defaults 0 0\n";
+        let td = TempDir::new(ambient_authority())?;
+        td.create_dir_all("usr/etc")?;
+        td.write("usr/etc/fstab", TEXT)?;
+        td.write("fstab", TEXT)?;
+        // Absolute and relative symlinks resolve below the root (cap-std
+        // refuses to create absolute ones)
+        let symlink = |target: &str, name: &str| rustix::fs::symlinkat(target, &*td, name);
+        symlink("/usr/etc/fstab", "abs")?;
+        symlink("usr/etc/fstab", "rel")?;
+        symlink("/usr/etc", "etc")?;
+        symlink("/missing", "dangling")?;
+        td.create_dir("dir")?;
+        rustix::fs::mknodat(
+            &*td,
+            "fifo",
+            rustix::fs::FileType::Fifo,
+            Mode::from_raw_mode(0o600),
+            0,
+        )?;
+        // Opening a socket fails with ENXIO
+        let _socket = std::os::unix::net::UnixListener::bind(format!(
+            "/proc/self/fd/{}/socket",
+            td.as_raw_fd()
+        ))?;
+        for (name, expected) in [
+            ("fstab", Some(TEXT)),
+            ("abs", Some(TEXT)),
+            ("rel", Some(TEXT)),
+            ("etc/fstab", Some(TEXT)),
+            ("missing", None),
+            ("dangling", None),
+            ("fstab/x", None),
+            ("dir", None),
+            ("fifo", None),
+            ("socket", None),
+        ] {
+            assert_eq!(read_in_root(&*td, name)?.as_deref(), expected, "{name}");
+        }
+        // An absolute target outside the root doesn't resolve on the host
+        symlink("/etc/os-release", "host")?;
+        assert_eq!(read_in_root(&*td, "host")?, None);
+        // A symlink loop is an error
+        symlink("loop", "loop")?;
+        assert!(read_in_root(&*td, "loop").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_root_fstab_mounts_var() -> Result<()> {
+        use cap_std_ext::cap_std::ambient_authority;
+        use cap_std_ext::cap_tempfile::TempDir;
+        for (fstab, expected) in [
+            (None, false),
+            (Some(&b"UUID=v /var ext4 defaults 0 0\n"[..]), true),
+            // Not UTF-8: a Latin-1 comment, and a stray byte in an entry
+            (
+                Some(&b"# caf\xe9\nUUID=v /var ext4 defaults 0 0\n"[..]),
+                true,
+            ),
+            (Some(&b"UUID=\xff /var ext4 defaults 0 0\n"[..]), true),
+            (Some(&b"UUID=\xff /var/log ext4 defaults 0 0\n"[..]), false),
+        ] {
+            let td = TempDir::new(ambient_authority())?;
+            td.create_dir("etc")?;
+            if let Some(fstab) = fstab {
+                td.write(FSTAB, fstab)?;
+            }
+            assert_eq!(root_fstab_mounts_var(&*td), expected, "{fstab:?}");
+        }
+        // An fstab that can't be read keeps the bind mount, also for root
+        let td = TempDir::new(ambient_authority())?;
+        td.create_dir("etc")?;
+        td.symlink("fstab", FSTAB)?;
+        assert!(read_in_root(&*td, FSTAB).is_err());
+        assert!(!root_fstab_mounts_var(&*td));
+        Ok(())
+    }
+
+    #[test]
+    fn test_fstab_mounts_var() {
+        let cases = [
+            ("", false),
+            ("UUID=abc /var ext4 defaults 0 0", true),
+            ("UUID=abc\t/var/\txfs defaults 0 0\n", true),
+            ("  /dev/vg/var //var ext4 defaults", true),
+            ("UUID=abc /var ext4", true),
+            // noauto still counts, as in ostree's fstab_has_mount_entry()
+            ("UUID=abc /var ext4 noauto 0 0", true),
+            ("UUID=abc /var ext4 x-systemd.automount 0 0", true),
+            ("# UUID=abc /var ext4 defaults 0 0", false),
+            ("#UUID=abc /var ext4 defaults 0 0", false),
+            ("  #UUID=abc /var ext4 defaults 0 0", false),
+            // Not a mount record: too few fields, or swap
+            ("UUID=abc /var", false),
+            ("/swapfile /var swap defaults 0 0", false),
+            // Only spaces and tabs separate fields
+            ("UUID=abc\u{2003}/var ext4 defaults 0 0", false),
+            ("UUID=abc\u{a0}/var\u{a0}ext4 defaults 0 0", false),
+            ("UUID=abc /var/log ext4 defaults 0 0", false),
+            ("UUID=abc /variable ext4 defaults 0 0", false),
+            ("UUID=abc var ext4 defaults 0 0", false),
+            ("UUID=abc /var/.. ext4 defaults 0 0", false),
+            (
+                "UUID=r / ext4 defaults 0 0\nUUID=b /boot ext4 defaults 0 0",
+                false,
+            ),
+            (
+                "UUID=r / ext4 defaults 0 0\nUUID=v /var ext4 defaults 0 0",
+                true,
+            ),
+        ];
+        for (fstab, expected) in cases {
+            assert_eq!(fstab_mounts_var(fstab), expected, "{fstab:?}");
+        }
+    }
+
+    #[test]
+    fn test_var_deferred() -> Result<()> {
+        use cap_std_ext::cap_std::ambient_authority;
+        use cap_std_ext::cap_tempfile::TempDir;
+        // A deployment state directory's var is a relative symlink to the
+        // stateroot's, as write_composefs_state() makes it
+        let td = TempDir::new(ambient_authority())?;
+        td.create_dir_all("state/os/default/var")?;
+        td.create_dir_all("state/deploy/abc")?;
+        td.symlink("../../os/default/var", "state/deploy/abc/var")?;
+        let state = td.open_dir("state/deploy/abc")?;
+        assert!(!var_deferred(&state));
+        td.write(format!("state/os/default/var/{DEFER_VAR_MARKER}"), "")?;
+        assert!(var_deferred(&state));
+        Ok(())
+    }
+
+    #[test]
+    fn test_var_config() -> Result<()> {
+        use cap_std_ext::cap_std::ambient_authority;
+        use cap_std_ext::cap_tempfile::TempDir;
+        const VAR_FSTAB: &str = "UUID=v /var ext4 defaults 0 0\n";
+        // (marker, fstab mounts /var, [var] config, expected mount)
+        let cases = [
+            (true, true, None, Some(MountType::None)),
+            (true, false, None, None),
+            (false, true, None, None),
+            (true, true, Some(MountType::Bind), Some(MountType::Bind)),
+        ];
+        for (marker, fstab, mount, expected) in cases {
+            let td = TempDir::new(ambient_authority())?;
+            td.create_dir_all("state/os/default/var")?;
+            td.create_dir_all("state/deploy/abc")?;
+            td.symlink("../../os/default/var", "state/deploy/abc/var")?;
+            if marker {
+                td.write(format!("state/os/default/var/{DEFER_VAR_MARKER}"), "")?;
+            }
+            td.create_dir_all("root/etc")?;
+            if fstab {
+                td.write("root/etc/fstab", VAR_FSTAB)?;
+            }
+            let var = MountConfig {
+                mount,
+                transient: false,
+            };
+            let got = var_config(var, td.open_dir("state/deploy/abc")?, td.open_dir("root")?);
+            assert_eq!(got.mount, expected, "{marker} {fstab} {mount:?}");
+            assert!(!got.transient);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_leave_var_to_fstab() {
+        use MountType::{Bind, Overlay};
+        let config = |mount, transient| MountConfig { mount, transient };
+        // (config, deferred, fstab mounts /var, expected)
+        let cases = [
+            // An explicit [var] setting wins, whatever the rest
+            (config(Some(Bind), false), true, true, false),
+            (config(Some(MountType::None), false), false, false, false),
+            (config(Some(Overlay), false), true, true, false),
+            // So does transient
+            (config(None, true), true, true, false),
+            // Deferred, and fstab mounts /var: leave it to fstab
+            (config(None, false), true, true, true),
+            // Otherwise keep the bind mount
+            (config(None, false), false, true, false),
+            (config(None, false), true, false, false),
+            (config(None, false), false, false, false),
+        ];
+        for (var, deferred, fstab, expected) in cases {
+            assert_eq!(
+                leave_var_to_fstab(&var, || deferred, || fstab),
+                expected,
+                "{var:?} {deferred} {fstab}"
+            );
+        }
+        // The fstab is only read for a deferred /var without a [var] setting
+        let never = || -> bool { panic!("checked needlessly") };
+        assert!(!leave_var_to_fstab(
+            &config(Some(Bind), false),
+            never,
+            never
+        ));
+        assert!(!leave_var_to_fstab(&config(None, false), || false, never));
     }
 
     #[test]
