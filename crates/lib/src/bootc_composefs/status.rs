@@ -676,6 +676,14 @@ fn boot_entry_from_composefs_deployment(
     };
 
     let boot_digest = origin.get::<String>(ORIGIN_KEY_BOOT, ORIGIN_KEY_BOOT_DIGEST);
+    // A malformed section is reported, not fatal: status must keep working.
+    let local_layer = super::local_layer::LocalLayer::from_origin(&origin)
+        .unwrap_or_else(|e| {
+            tracing::warn!("Deployment {verity}: ignoring its local layer: {e:#}");
+            None
+        })
+        .as_ref()
+        .map(Into::into);
 
     let e = BootEntry {
         image,
@@ -691,6 +699,7 @@ fn boot_entry_from_composefs_deployment(
             bootloader,
             boot_digest,
             missing_verity_allowed,
+            local_layer,
         }),
         soft_reboot_capable: false,
     };

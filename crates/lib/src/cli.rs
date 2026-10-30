@@ -825,6 +825,29 @@ pub(crate) fn parse_absolute_path(value: &str) -> std::result::Result<Utf8PathBu
     }
 }
 
+/// Subcommands for `bootc internals local-layer`.
+#[derive(Debug, clap::Subcommand, PartialEq, Eq)]
+pub(crate) enum LocalLayerOpts {
+    /// Run a command against the next boot's image and stage the result.
+    ///
+    /// The command runs chrooted in a staging root (a writable overlay over
+    /// the base image of the next boot's deployment, the staged one if
+    /// there is one), as in a container build: in its own PID, mount, UTS
+    /// and IPC namespaces, with read-only /sys, a minimal /dev and fewer
+    /// capabilities, but the host's network. Its changes become a layer on
+    /// top of the base, deployed as a new deployment. Every command
+    /// recorded so far is re-run with it, and `bootc upgrade` re-runs them
+    /// on the new base. composefs backend only.
+    Run {
+        /// Reboot into the new deployment once it is staged.
+        #[clap(long)]
+        apply: bool,
+        /// The command and its arguments.
+        #[clap(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+}
+
 /// Hidden, internal only options
 #[derive(Debug, clap::Subcommand, PartialEq, Eq)]
 pub(crate) enum InternalsOpts {
@@ -869,6 +892,9 @@ pub(crate) enum InternalsOpts {
         #[clap(allow_hyphen_values = true)]
         args: Vec<OsString>,
     },
+    /// Experimental: local changes on top of the booted composefs image
+    #[clap(subcommand)]
+    LocalLayer(LocalLayerOpts),
     /// Proxy frontend for the `cfsctl` CLI
     Cfs {
         #[clap(allow_hyphen_values = true)]
@@ -2645,6 +2671,23 @@ async fn run_from_opt(opt: Opt) -> Result<CliExitStatus> {
                 }
             }
             InternalsOpts::Cfs { args } => composefs_ctl::run_from_iter(args.iter()).await,
+            InternalsOpts::LocalLayer(LocalLayerOpts::Run { apply, command }) => {
+                let storage = &get_storage().await?;
+                match storage.kind()? {
+                    BootedStorageKind::Ostree(_) => {
+                        anyhow::bail!("local-layer is only supported on the composefs backend")
+                    }
+                    BootedStorageKind::Composefs(booted_cfs) => {
+                        crate::bootc_composefs::local_layer::run(
+                            storage,
+                            &booted_cfs,
+                            command,
+                            apply,
+                        )
+                        .await
+                    }
+                }
+            }
             InternalsOpts::Reboot => crate::reboot::reboot(),
             InternalsOpts::Fsck => {
                 let storage = &get_storage().await?;

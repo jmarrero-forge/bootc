@@ -27,6 +27,7 @@ use crate::{
             setup_composefs_uki_boot,
         },
         gc::composefs_gc,
+        local_layer::{BuildLock, LocalLayer},
         repo::{PullRepoResult, pull_composefs_repo},
         service::start_finalize_stated_svc,
         soft_reboot::prepare_soft_reboot_composefs,
@@ -271,6 +272,7 @@ fn ensure_no_aboot_attempt(storage: &Storage) -> Result<()> {
 }
 
 /// This is just an intersection of SwitchOpts and UpgradeOpts
+#[derive(Default)]
 pub(crate) struct DoUpgradeOpts<'a> {
     pub(crate) apply: bool,
     pub(crate) soft_reboot: Option<SoftRebootMode>,
@@ -311,7 +313,10 @@ async fn apply_upgrade(
     Ok(())
 }
 
-/// Performs the Update or Switch operation
+/// Performs the Update or Switch operation.
+///
+/// With a `local_layer`, its commands are re-run on the pulled image and the
+/// derived image is deployed instead (see [`super::local_layer`]).
 #[context("Performing Upgrade Operation")]
 pub(crate) async fn do_upgrade(
     storage: &Storage,
@@ -320,6 +325,7 @@ pub(crate) async fn do_upgrade(
     imgref: &ImageReference,
     opts: &DoUpgradeOpts<'_>,
     manifest: &ostree_ext::oci_spec::image::ImageManifest,
+    local_layer: Option<(&LocalLayer, &BuildLock)>,
 ) -> Result<()> {
     // Unpulled images bypass validate_update(), so check aboot state here too.
     if host.require_composefs_booted()?.boot_type == BootType::Aboot {
@@ -353,12 +359,36 @@ pub(crate) async fn do_upgrade(
         );
     }
 
-    deploy_pulled(storage, booted_cfs, host, imgref, opts, pulled).await
+    let Some((local_layer, lock)) = local_layer else {
+        return deploy_pulled(storage, booted_cfs, host, imgref, opts, pulled, None).await;
+    };
+    // Only the repository is needed from the base; the rest goes now.
+    let PullRepoResult {
+        repo,
+        manifest_digest,
+        ..
+    } = pulled;
+    let layer = local_layer.on_base(&manifest_digest);
+    println!("Rebuilding the local layer on {manifest_digest}");
+    let allow_missing_fsverity = booted_cfs.cmdline.allow_missing_fsverity;
+    let repo = std::sync::Arc::new(repo);
+    let derived = super::local_layer::build_derived(&repo, &layer, lock).await?;
+    let pulled = super::repo::boot_image_for_pulled(repo, &derived, allow_missing_fsverity)?;
+    deploy_pulled(
+        storage,
+        booted_cfs,
+        host,
+        imgref,
+        opts,
+        pulled,
+        Some(&layer),
+    )
+    .await
 }
 
 /// Deploys an image that is in the composefs repository: checks it against
 /// the existing deployments, sets up its boot entry and state, stages it,
-/// and runs the repository GC.
+/// and runs the repository GC. `local_layer` is recorded in its origin.
 #[context("Deploying image")]
 pub(crate) async fn deploy_pulled(
     storage: &Storage,
@@ -367,6 +397,7 @@ pub(crate) async fn deploy_pulled(
     imgref: &ImageReference,
     opts: &DoUpgradeOpts<'_>,
     pulled: PullRepoResult,
+    local_layer: Option<&LocalLayer>,
 ) -> Result<()> {
     let PullRepoResult {
         repo,
@@ -390,6 +421,18 @@ pub(crate) async fn deploy_pulled(
             "Target image has the same fs-verity digest as the existing {:?} deployment.",
             collision.ty,
         );
+    }
+    // So any state dir for this image now was left by an interrupted
+    // deploy. validate_update removes those before a pull, but a local
+    // layer comes here directly.
+    let state_dir = storage
+        .physical_root
+        .open_dir(STATE_DIR_RELATIVE)
+        .context("Opening state dir")?;
+    if state_dir.exists(id.to_hex()) {
+        state_dir
+            .remove_dir_all(id.to_hex())
+            .context("Removing a stale state dir")?;
     }
 
     let entry = super::boot::primary_boot_entry(&entries)?;
@@ -489,6 +532,7 @@ pub(crate) async fn deploy_pulled(
         boot_digest,
         &manifest_digest,
         booted_cfs.cmdline.allow_missing_fsverity,
+        local_layer,
     )
     .await?;
 
@@ -616,6 +660,9 @@ pub(crate) async fn upgrade_composefs(
         "Starting composefs upgrade operation"
     );
 
+    // Before reading the deployments, so that a local layer run doesn't
+    // stage over what this stages or the other way around.
+    let lock = BuildLock::acquire()?;
     let host = get_composefs_status(storage, composefs)
         .await
         .context("Getting composefs deployment status")?;
@@ -688,6 +735,40 @@ pub(crate) async fn upgrade_composefs(
             .map(|(pulled, img, digest)| (pulled, img.manifest, digest))?,
     };
 
+    // A local layer is rebuilt on each new base image, so compare the target
+    // with the base the pending layer (staged, else booted) was built on, not
+    // with the derived image. A staged deployment without a layer, such as a
+    // `bootc switch`, has dropped it, and is handled below.
+    if let Some(layer) = super::local_layer::pending_layer(&host) {
+        if layer.base_manifest_digest == manifest_digest {
+            if host.status.staged.is_some() {
+                if opts.apply {
+                    return crate::reboot::reboot();
+                }
+                println!("Update already staged. To apply update run `bootc update --apply`");
+            } else {
+                println!("No changes in: {booted_imgref:#}");
+            }
+            return Ok(());
+        }
+        if opts.check {
+            println!(
+                "Base image update available; the local layer will be rebuilt on {manifest_digest}"
+            );
+            return Ok(());
+        }
+        return do_upgrade(
+            storage,
+            composefs,
+            &host,
+            booted_imgref,
+            &do_upgrade_opts,
+            &manifest,
+            Some((&layer, &lock)),
+        )
+        .await;
+    }
+
     // Check if we already have this update staged
     // Or if we have another staged deployment with a different image
     let staged_image = host.status.staged.as_ref().and_then(|i| i.image.as_ref());
@@ -743,6 +824,7 @@ pub(crate) async fn upgrade_composefs(
                         booted_imgref,
                         &do_upgrade_opts,
                         &manifest,
+                        None,
                     )
                     .await;
                 }
@@ -775,6 +857,7 @@ pub(crate) async fn upgrade_composefs(
                     booted_imgref,
                     &do_upgrade_opts,
                     &manifest,
+                    None,
                 )
                 .await;
             }
@@ -795,6 +878,7 @@ pub(crate) async fn upgrade_composefs(
         booted_imgref,
         &do_upgrade_opts,
         &manifest,
+        None,
     )
     .await?;
 

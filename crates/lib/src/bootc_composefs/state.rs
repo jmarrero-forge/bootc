@@ -260,6 +260,7 @@ pub(crate) async fn write_composefs_state(
     boot_digest: String,
     manifest_digest: &str,
     allow_missing_fsverity: bool,
+    local_layer: Option<&super::local_layer::LocalLayer>,
 ) -> Result<()> {
     let state_path = root_path
         .join(STATE_DIR_RELATIVE)
@@ -306,6 +307,10 @@ pub(crate) async fn write_composefs_state(
     config = config
         .section(ORIGIN_KEY_IMAGE)
         .item(ORIGIN_KEY_MANIFEST_DIGEST, manifest_digest);
+
+    if let Some(layer) = local_layer {
+        config = layer.to_origin(config)?;
+    }
 
     let state_dir =
         Dir::open_ambient_dir(&state_path, ambient_authority()).context("Opening state dir")?;

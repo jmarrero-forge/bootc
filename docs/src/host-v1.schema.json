@@ -144,6 +144,17 @@
           "description": "Whether we boot using systemd or grub",
           "$ref": "#/$defs/Bootloader"
         },
+        "localLayer": {
+          "description": "Changes made locally on top of the image (experimental; see\n`bootc internals local-layer`)",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LocalLayerStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "missingVerityAllowed": {
           "description": "Whether fs-verity validation is optional",
           "type": "boolean"
@@ -489,6 +500,30 @@
         "image",
         "imageDigest",
         "architecture"
+      ]
+    },
+    "LocalLayerStatus": {
+      "description": "A local layer: commands run against the base image, whose changes form\none more layer on top of it",
+      "type": "object",
+      "properties": {
+        "baseImageDigest": {
+          "description": "The manifest digest of the image the layer was built on",
+          "type": "string"
+        },
+        "commands": {
+          "description": "The commands, in order, each as its argument vector",
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "required": [
+        "commands",
+        "baseImageDigest"
       ]
     },
     "ObjectMeta": {

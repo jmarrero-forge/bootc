@@ -273,3 +273,8 @@ check:
   summary: Install from a shared mount namespace without leaking the storage bind mount
   duration: 30m
   test: nu booted/test-install-shared-propagation.nu
+
+/test-65-composefs-local-layer:
+  summary: Test composefs local layers (bootc internals local-layer)
+  duration: 45m
+  test: nu booted/test-composefs-local-layer.nu
