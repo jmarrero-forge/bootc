@@ -703,6 +703,13 @@ fn human_render_slot(
     if let Some(composefs) = &entry.composefs {
         write_row_name(&mut out, "Verity", prefix_len)?;
         writeln!(out, "{}", composefs.verity)?;
+        if let Some(layer) = &composefs.local_layer {
+            let commands: Vec<String> = layer.commands.iter().map(|a| a.join(" ")).collect();
+            write_row_name(&mut out, "Local layer", prefix_len)?;
+            writeln!(out, "{}", commands.join(" && "))?;
+            write_row_name(&mut out, "Base digest", prefix_len)?;
+            writeln!(out, "{}", layer.base_image_digest)?;
+        }
     }
 
     let timestamp = image.timestamp.as_ref().map(format_timestamp);

@@ -425,4 +425,12 @@ execute:
     test:
       - /tmt/tests/tests/test-63-install-shared-propagation
   extra-fixme_skip_if_composefs: true
+
+/plan-65-composefs-local-layer:
+  summary: Test composefs local layers (bootc internals local-layer)
+  discover:
+    how: fmf
+    test:
+      - /tmt/tests/tests/test-65-composefs-local-layer
+  extra-skip_if_ostree: true
 # END GENERATED PLANS

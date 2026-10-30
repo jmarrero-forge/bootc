@@ -546,6 +546,8 @@ pub(crate) async fn composefs_gc(
     let mut additional_roots = Vec::new();
     // Container image names for containers-storage pruning.
     let mut live_container_images: std::collections::HashSet<String> = Default::default();
+    // Set when a local layer's base can't be read: then no bootc image goes.
+    let mut keep_all_bootc_images = false;
 
     // Read existing tags before the deployment loop so we can search
     // them for deployments that lack manifest_digest in their origin.
@@ -587,6 +589,23 @@ pub(crate) async fn composefs_gc(
                     .parse()
                     .with_context(|| format!("Parsing manifest digest {manifest_digest_str}"))?;
                 live_manifest_digests.push(digest);
+                // A local layer's base stays too: it is what the layer is
+                // rebuilt on, and what `local-layer run` stages over. If the
+                // base can't be read, every bootc image stays rather than
+                // that one going.
+                match super::local_layer::LocalLayer::from_origin(&ini)
+                    .and_then(|l| l.map(|l| l.base_digest()).transpose())
+                {
+                    Ok(Some(base)) => live_manifest_digests.push(base),
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            "Deployment {verity}: can't read its local layer, so keeping \
+                             every bootc image: {e:#}"
+                        );
+                        keep_all_bootc_images = true;
+                    }
+                }
             } else {
                 // Pre-OCI-metadata deployment: search tagged manifests
                 // for one whose config links to this EROFS image.
@@ -649,7 +668,7 @@ pub(crate) async fn composefs_gc(
             continue;
         }
 
-        if !live_manifest_digests.iter().any(|d| d == manifest_digest) {
+        if !keep_all_bootc_images && !live_manifest_digests.iter().any(|d| d == manifest_digest) {
             tracing::debug!("Removing unreferenced bootc tag: {tag_name}");
             if !gc_opts.dry_run {
                 composefs_oci::untag_image(&*booted_cfs.repo, tag_name)

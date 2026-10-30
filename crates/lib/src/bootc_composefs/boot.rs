@@ -2942,6 +2942,7 @@ pub(crate) async fn setup_composefs_boot(
         boot_digest,
         &pull_result.manifest_digest.to_string(),
         allow_missing_fsverity,
+        None,
     )
     .await?;
 
