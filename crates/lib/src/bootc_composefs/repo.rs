@@ -613,12 +613,22 @@ pub(crate) async fn pull_composefs_repo(
         "Pulled image into composefs repository",
     );
 
+    boot_image_for_pulled(repo, &pull_result, allow_missing_fsverity)
+}
+
+/// Prepares the boot image of an image already in the repository (pulled,
+/// or derived from one that was) and returns everything a deployment needs.
+pub(crate) fn boot_image_for_pulled(
+    repo: Arc<crate::store::ComposefsRepository>,
+    pull_result: &PullResult<Sha512HashValue>,
+    allow_missing_fsverity: bool,
+) -> Result<PullRepoResult> {
     let BootImage {
         id,
         boot_ids,
         fs,
         entries,
-    } = prepare_boot_image(&repo, &pull_result)?;
+    } = prepare_boot_image(&repo, pull_result)?;
 
     // Unwrap the Arc to get the owned repo back.
     let mut repo = Arc::try_unwrap(repo).map_err(|_| {
