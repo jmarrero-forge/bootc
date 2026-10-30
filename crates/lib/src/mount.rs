@@ -133,7 +133,10 @@ pub(crate) async fn mount(opts: MountOpts) -> Result<()> {
                     .open_dir(format!("{STATE_DIR_RELATIVE}/{id}"))
                     .with_context(|| format!("Opening composefs deployment state {id}"))?;
                 let repo = crate::bootc_composefs::repo::open_composefs_repo(&sysroot_dir)?;
-                let image = repo.mount(id).context("Mounting composefs image")?;
+                let root_format =
+                    crate::bootc_composefs::image_set::deployment_root_format(&repo, id)?;
+                let image =
+                    crate::bootc_composefs::boot::mount_composefs_root(&repo, id, root_format)?;
                 (image, DeploymentState::Composefs(state))
             }
             DeploymentBackend::Ostree => {

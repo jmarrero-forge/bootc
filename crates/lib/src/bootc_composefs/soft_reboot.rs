@@ -114,11 +114,14 @@ pub(crate) async fn prepare_soft_reboot_composefs(
     // We don't persist which EROFS format each deployment was written with, so
     // fall back to the repo's currently configured default.  This only affects
     // the karg's self-description, not whether the soft-reboot actually
-    // succeeds: `setup_root` (below) resolves the deployment purely from the
-    // digest, independent of the composefs=/composefs.digest= tag.
+    // succeeds: `setup_root` (below) resolves an image purely from the
+    // digest, independent of the composefs=/composefs.digest= tag.  An image
+    // set, though, must be named as one.
+    let root_format =
+        crate::bootc_composefs::image_set::deployment_root_format(&booted_cfs.repo, deployment_id)?;
     let cmdline = build_composefs_karg(
         deployment_digest,
-        booted_cfs.repo.erofs_version(),
+        root_format,
         booted_cfs.cmdline.allow_missing_fsverity,
     );
 

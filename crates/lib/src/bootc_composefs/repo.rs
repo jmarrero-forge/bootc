@@ -62,10 +62,12 @@ use cap_std_ext::{
 use rustix::fs::{FlockOperation, flock};
 
 use crate::bootc_composefs::boot::{
-    ExpectedBootImageIds, ensure_correct_composefs_digest, expected_boot_image_ids,
-    print_uki_dumpfile_diff_on_mismatch,
+    BootType, ExpectedBootImageIds, ensure_correct_composefs_digest, expected_boot_image_ids,
+    primary_boot_entry, print_uki_dumpfile_diff_on_mismatch,
 };
+use crate::bootc_composefs::image_set;
 use crate::bootc_composefs::progress;
+use crate::bootc_composefs::status::RootFormat;
 use crate::composefs_consts::BOOTC_TAG_PREFIX;
 use crate::install::{RootSetup, State};
 use crate::lsm;
@@ -309,6 +311,8 @@ pub(crate) struct PullRepoResult {
     pub(crate) repo: crate::store::ComposefsRepository,
     pub(crate) entries: Vec<ComposefsBootEntry<Sha512HashValue>>,
     pub(crate) id: Sha512HashValue,
+    /// What `id` names: an image, or an image set
+    pub(crate) root_format: RootFormat,
     pub(crate) boot_ids: ExpectedBootImageIds,
     /// The OCI manifest content digest (e.g. "sha256:abc...")
     pub(crate) manifest_digest: String,
@@ -319,6 +323,8 @@ pub(crate) struct PullRepoResult {
 /// The boot-facing artifacts reconstructed from a pulled OCI image.
 pub(crate) struct BootImage {
     pub(crate) id: Sha512HashValue,
+    /// What `id` names: an image, or an image set
+    pub(crate) root_format: RootFormat,
     pub(crate) boot_ids: ExpectedBootImageIds,
     pub(crate) fs: FileSystem<Sha512HashValue>,
     pub(crate) entries: Vec<ComposefsBootEntry<Sha512HashValue>>,
@@ -370,8 +376,30 @@ pub(crate) fn prepare_boot_image(
         &fs,
     )?;
 
+    let Some(parts) = image_set::boot_image_set_parts(&fs, repo)? else {
+        return Ok(BootImage {
+            id: recovered.id,
+            root_format: repo.erofs_version().into(),
+            boot_ids: recovered.expected_ids,
+            fs,
+            entries,
+        });
+    };
+
+    // The image asks for an image set: the deployment is named by the set,
+    // whose root component is this same boot image minus the split-out parts.
+    let boot_type = BootType::from(primary_boot_entry(&entries)?);
+    anyhow::ensure!(
+        boot_type == BootType::Bls,
+        "{} asks for an image set, which is only supported with BLS boot entries, not {boot_type:?}",
+        image_set::IMAGE_SET_CONF
+    );
+    let id = image_set::commit_image_set(repo, &parts)?;
+    tracing::info!("Image set {}", id.to_hex());
+
     Ok(BootImage {
-        id: recovered.id,
+        id,
+        root_format: RootFormat::ImageSet,
         boot_ids: recovered.expected_ids,
         fs,
         entries,
@@ -615,6 +643,7 @@ pub(crate) async fn pull_composefs_repo(
 
     let BootImage {
         id,
+        root_format,
         boot_ids,
         fs,
         entries,
@@ -632,6 +661,7 @@ pub(crate) async fn pull_composefs_repo(
         repo,
         entries,
         id,
+        root_format,
         boot_ids,
         manifest_digest: pull_result.manifest_digest.to_string(),
         fs,

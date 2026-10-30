@@ -136,6 +136,8 @@ and may change or be removed:
   staged.
 - [Android A/B boot images and ukiboot](bootc-experimental-composefs-aboot.7.md).
 - [Unified storage](bootc-experimental-unified-storage.7.md).
+- [Image sets](bootc-experimental-composefs-image-sets.7.md), several EROFS
+  images under one `composefs.digest=`.
 
 ## Limitations
 
