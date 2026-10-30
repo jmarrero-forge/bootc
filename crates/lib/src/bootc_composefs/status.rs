@@ -10,7 +10,7 @@ use composefs_ctl::composefs_boot::cmdline::{
 use composefs_ctl::composefs_oci;
 use composefs_oci::OciImage;
 use fn_error_context::context;
-use linux_kernel_cmdline::utf8::Cmdline;
+use linux_kernel_cmdline::utf8::{Cmdline, Parameter};
 use openssl::sha::Sha256;
 use serde::{Deserialize, Serialize};
 
@@ -751,25 +751,21 @@ fn find_bls_entry<'a>(
     Ok(None)
 }
 
-/// Compares cmdline `first` and `second` skipping either composefs karg spelling.
-fn compare_cmdline_skip_cfs(first: &Cmdline<'_>, second: &Cmdline<'_>) -> bool {
-    for param in first {
-        if param.key() == KARG_V2.into() || param.key() == KARG_COMPOSEFS_DIGEST.into() {
-            continue;
-        }
-
-        let second_param = second.iter().find(|b| *b == param);
-
-        let Some(found_param) = second_param else {
+/// Whether cmdlines `first` and `second` have the same arguments, in any order,
+/// apart from the composefs karg (in either spelling), which names the
+/// deployment and so always differs.
+fn cmdline_eq_skip_cfs(first: &Cmdline<'_>, second: &Cmdline<'_>) -> bool {
+    let is_cfs = |param: &Parameter<'_>| {
+        param.key() == KARG_V2.into() || param.key() == KARG_COMPOSEFS_DIGEST.into()
+    };
+    let mut unmatched: Vec<_> = second.iter().filter(|param| !is_cfs(param)).collect();
+    for param in first.iter().filter(|param| !is_cfs(param)) {
+        let Some(pos) = unmatched.iter().position(|other| *other == param) else {
             return false;
         };
-
-        if found_param.value() != param.value() {
-            return false;
-        }
+        unmatched.swap_remove(pos);
     }
-
-    return true;
+    unmatched.is_empty()
 }
 
 #[context("Setting soft reboot capability for Type1 entries")]
@@ -845,18 +841,12 @@ fn is_soft_rebootable(
         return Ok(false);
     }
 
-    if target.full_cmdline.as_bytes().len() != booted.full_cmdline.as_bytes().len() {
+    if !cmdline_eq_skip_cfs(target.full_cmdline, booted.full_cmdline) {
         tracing::debug!("Soft reboot not allowed due to differing cmdline");
         return Ok(false);
     }
 
-    let cmdline_eq = compare_cmdline_skip_cfs(target.full_cmdline, booted.full_cmdline)
-        && compare_cmdline_skip_cfs(booted.full_cmdline, target.full_cmdline);
-
-    let selinux_compatible =
-        are_selinux_policies_compatible(storage, booted_cmdline, target.verity)?;
-
-    return Ok(cmdline_eq && selinux_compatible);
+    are_selinux_policies_compatible(storage, booted_cmdline, target.verity)
 }
 
 #[context("Setting soft reboot capability for UKI deployments")]
@@ -1919,6 +1909,41 @@ mod tests {
         assert_eq!(result, expected);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_cmdline_eq_skip_cfs() {
+        let hex = "ab".repeat(64);
+        let base = "root=UUID=1 rw console=ttyS0 console=hvc0";
+        let v2 = format!("composefs={hex} {base}");
+        let v1 = format!("{base} composefs.digest=v1-sha512-12:{hex}");
+        let cases = [
+            (v2.as_str(), v1.as_str(), true),
+            (v2.as_str(), base, true),
+            (base, "console=hvc0 rw console=ttyS0 root=UUID=1", true),
+            (base, "root-UUID=1 rw console=ttyS0 console=hvc0", false),
+            (base, "root=UUID=1 rw console=ttyS0", false),
+            (
+                base,
+                "root=UUID=1 rw console=ttyS0 console=hvc0 console=hvc0",
+                false,
+            ),
+            (base, "root=UUID=2 rw console=ttyS0 console=hvc0", false),
+            ("a-b=1 rw", "a_b=1 rw", true),
+        ];
+        for (first, second, expected) in cases {
+            let (first, second) = (Cmdline::from(first), Cmdline::from(second));
+            assert_eq!(
+                cmdline_eq_skip_cfs(&first, &second),
+                expected,
+                "{first} / {second}"
+            );
+            assert_eq!(
+                cmdline_eq_skip_cfs(&second, &first),
+                expected,
+                "{second} / {first}"
+            );
+        }
     }
 
     #[test]
