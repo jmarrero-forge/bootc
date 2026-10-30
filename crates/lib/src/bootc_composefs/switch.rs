@@ -22,6 +22,9 @@ pub(crate) async fn switch_composefs(
     booted_cfs: &BootedComposefs,
 ) -> Result<()> {
     // TODO: Handle in-place
+    // As for an upgrade: a local layer run must not stage over this, nor
+    // this over it.
+    let _lock = super::local_layer::BuildLock::acquire()?;
     let mut host = get_composefs_status(storage, booted_cfs)
         .await
         .context("Getting composefs deployment status")?;
@@ -157,6 +160,7 @@ pub(crate) async fn switch_composefs(
                     &target_imgref,
                     &do_upgrade_opts,
                     &manifest,
+                    None,
                 )
                 .await;
             }
@@ -170,6 +174,8 @@ pub(crate) async fn switch_composefs(
         &target_imgref,
         &do_upgrade_opts,
         &manifest,
+        // A switch to another image drops the local layer.
+        None,
     )
     .await?;
 
