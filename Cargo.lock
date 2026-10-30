@@ -338,6 +338,7 @@ dependencies = [
  "anyhow",
  "cap-std-ext",
  "chrono",
+ "libc",
  "owo-colors",
  "rustix",
  "serde",
