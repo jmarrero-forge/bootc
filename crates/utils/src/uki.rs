@@ -1,8 +1,13 @@
 /// Create a minimal valid PE file for testing UKI parsing
 pub fn create_minimal_pe() -> Vec<u8> {
+    create_pe_with_cmdline(b"quiet splash")
+}
+
+/// Create a minimal valid PE file whose only section is a `.cmdline` holding
+/// `section_data`, for testing UKI parsing
+pub fn create_pe_with_cmdline(section_data: &[u8]) -> Vec<u8> {
     let mut pe = Vec::new();
     let section_data_offset = 0x200u32; // Standard section alignment
-    let section_data = b"quiet splash"; // Sample cmdline content
 
     // DOS header (64 bytes)
     pe.extend_from_slice(b"MZ"); // e_magic

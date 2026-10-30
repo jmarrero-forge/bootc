@@ -1359,6 +1359,7 @@ fn file_from_type2_entry(
 #[context("Parsing UKI cmdline from {uki_name}")]
 /// Makes sure there is no composefs= cmdline in a global UKI Addon
 /// Makes sure if we already have a parsed cmdline, we don't find another one
+/// Makes sure only the UKI itself pins a kernel modules image
 fn parse_uki_cmdline<R: Read + Seek>(
     pe_type: &PEType,
     missing_fsverity_allowed: bool,
@@ -1403,6 +1404,12 @@ fn parse_uki_cmdline<R: Read + Seek>(
     };
 
     tracing::debug!("cmdline found in {pe_type:?}: {cmdline_str}");
+
+    // Only the UKI may pin the kernel modules image; this is checked before
+    // the early return below, since an addon usually has no composefs=
+    if !matches!(pe_type, PEType::Uki) {
+        crate::bootc_composefs::kmods::ensure_no_kmods_pin(cmdline_str, uki_name)?;
+    }
 
     let composefs_candidates = parse_uki_composefs_candidates(&cmdline_str)
         .context("Parsing composefs kernel arguments")?;
@@ -1456,18 +1463,113 @@ fn parse_uki_cmdline<R: Read + Seek>(
     Ok(())
 }
 
+/// Whether systemd-stub loads `name` from an addons directory: like its
+/// `load_addons_from_dir`, this matches the suffix case-insensitively.
+fn is_addon_file_name(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(EFI_ADDON_FILE_EXT)
+}
+
+/// Refuse to carry `entry_name`, a global addon in `dir` (the ESP's
+/// [`GLOBAL_UKI_ADDONS_DIR`]), over to a new deployment if its cmdline pins
+/// a kernel modules image.
+///
+/// These addons were checked when they were added, but they could also have
+/// been copied there by hand, and a pin in one would fail the new
+/// deployment's boot.
+fn check_carried_global_addon(dir: &Dir, entry_name: &str) -> Result<()> {
+    let path = format!("{GLOBAL_UKI_ADDONS_DIR}/{entry_name}");
+    let mut addon = dir
+        .open(entry_name)
+        .with_context(|| format!("Opening {path}"))?;
+    // One that can't be parsed is refused too: systemd-stub has a PE parser
+    // of its own, which might still load a cmdline from it
+    let cmdline = match uki::get_cmdline_buffered(&mut addon) {
+        Ok(cmdline) => cmdline,
+        Err(uki::UkiError::MissingSection(..)) => return Ok(()),
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!("Reading the cmdline of the global UKI Addon {path}, to check it before carrying it over")
+            });
+        }
+    };
+    let source = format!("the global UKI Addon {path}");
+    let Err(e) = crate::bootc_composefs::kmods::ensure_no_kmods_pin(&cmdline, &source) else {
+        return Ok(());
+    };
+    // `bootc uki-addon remove` only finds the global addons that it manages
+    let managed_name = entry_name
+        .strip_suffix(EFI_ADDON_FILE_EXT)
+        .and_then(|name| name.strip_prefix(UKI_NAME_PREFIX));
+    let hint = match managed_name {
+        Some(name) => format!(
+            "Remove it with `bootc uki-addon remove {name} global` while no deployment is staged, then retry"
+        ),
+        None => {
+            format!("It is not managed by bootc: remove {path} from the ESP by hand, then retry")
+        }
+    };
+    anyhow::bail!("{e:#}. {hint}")
+}
+
+/// The file names of the global addons in `entries` (those the new image
+/// writes itself), named as `write_pe_to_esp` names them on the ESP.
+fn replaced_global_addons(entries: &[Type2Entry<Sha512HashValue>]) -> Result<Vec<String>> {
+    entries
+        .iter()
+        .filter(|entry| matches!(entry.pe_type, PEType::GlobalUkiAddon))
+        .map(|entry| {
+            let name = entry
+                .file_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| anyhow!("Invalid UKI Addon path {:?}", entry.file_path))?;
+            Ok(get_global_uki_addon_name(name))
+        })
+        .collect()
+}
+
 /// Copies Global UKI Addons from loader/addons to loader/addons.staged in case of
 /// an upgrade/switch
+///
+/// `replaced` names the global addons that the new image writes into
+/// loader/addons.staged itself: their live copies are neither checked nor
+/// copied, so that an unchecked copy can't stay staged if writing the
+/// image's own fails, or sit next to it under another case.
 #[context("Staging Global UKI Addons")]
-fn stage_global_uki_addons(esp_fd: &Dir) -> Result<()> {
-    // Remove any previously staged addons
+fn stage_global_uki_addons(esp_fd: &Dir, replaced: &[String]) -> Result<()> {
+    let global_addons_dir = esp_fd.open_dir_optional(GLOBAL_UKI_ADDONS_DIR)?;
+
+    let mut entry_names = vec![];
+    if let Some(global_addons_dir) = &global_addons_dir {
+        for ent in global_addons_dir
+            .entries_utf8()
+            .context("Reading entries in Global UKI directory")?
+        {
+            entry_names.push(ent?.file_name().context("Reading file name")?);
+        }
+
+        // Leave out the addons that the new image replaces
+        entry_names.retain(|entry_name| {
+            !replaced
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(entry_name))
+        });
+
+        // Check every addon before staging any
+        for entry_name in entry_names.iter().filter(|name| is_addon_file_name(name)) {
+            check_carried_global_addon(global_addons_dir, entry_name)?;
+        }
+    }
+
+    // Remove any previously staged addons, only now so that a refusal above
+    // keeps what an earlier upgrade staged
     if esp_fd.exists(STAGED_GLOBAL_UKI_ADDONS_DIR) {
         esp_fd
             .remove_dir_all(STAGED_GLOBAL_UKI_ADDONS_DIR)
             .context("Removing previously staged global addons")?;
     };
 
-    let Some(global_addons_dir) = esp_fd.open_dir_optional(GLOBAL_UKI_ADDONS_DIR)? else {
+    let Some(global_addons_dir) = global_addons_dir else {
         // No current Global UKI Addons to copy
         return Ok(());
     };
@@ -1481,12 +1583,7 @@ fn stage_global_uki_addons(esp_fd: &Dir) -> Result<()> {
         .context("Opening staged Global UKI Addons dir")?;
 
     // Now copy all addons to the staged directory
-    for ent in global_addons_dir
-        .entries_utf8()
-        .context("Reading entries in Global UKI directory")?
-    {
-        let entry = ent?;
-        let entry_name = entry.file_name().context("Reading file name")?;
+    for entry_name in entry_names {
         global_addons_dir
             .copy(&entry_name, &staged_addons_dir, &entry_name)
             .with_context(|| format!("Copying addon {entry_name}"))?;
@@ -1563,6 +1660,22 @@ fn uki_file_name(file_path: &Path) -> Result<String> {
         .ok_or_else(|| anyhow!("Could not get UKI file name from {file_path}"))
 }
 
+/// Read the cmdline of a UKI stored in the repository.
+pub(crate) fn read_uki_cmdline(
+    repo: &crate::store::ComposefsRepository,
+    file: &RegularFile<Sha512HashValue>,
+) -> Result<String> {
+    let mut reader = match file {
+        RegularFile::External(id, ..) | RegularFile::ExternalNoVerity(id, ..) => {
+            std::fs::File::from(repo.open_object(id)?)
+        }
+        RegularFile::Inline(..) | RegularFile::Sparse(..) => {
+            anyhow::bail!("UKI file is not a regular external object")
+        }
+    };
+    uki::get_cmdline_buffered(&mut reader).context("Getting UKI cmdline")
+}
+
 /// Inspect primary boot artifacts to discover the image's fs-verity policy
 /// before creating the durable repository. Final artifact validation occurs
 /// while installing the boot artifact.
@@ -1574,15 +1687,7 @@ pub(crate) fn image_fsverity_policy(
     for entry in entries {
         let cmdline = match entry {
             ComposefsBootEntry::Type2(entry) if matches!(entry.pe_type, PEType::Uki) => {
-                let mut reader = match &entry.file {
-                    RegularFile::External(id, ..) | RegularFile::ExternalNoVerity(id, ..) => {
-                        std::fs::File::from(repo.open_object(id)?)
-                    }
-                    RegularFile::Inline(..) | RegularFile::Sparse(..) => {
-                        anyhow::bail!("UKI file is not a regular external object")
-                    }
-                };
-                uki::get_cmdline_buffered(&mut reader).context("Getting UKI cmdline")?
+                read_uki_cmdline(repo, &entry.file)?
             }
             ComposefsBootEntry::Aboot(entry) => {
                 let payload = read_aboot_payload(entry, repo)?;
@@ -1630,20 +1735,10 @@ fn find_expected_composefs_digest(
                     entry.payload.path.display().to_string(),
                 )
             }
-            ComposefsBootEntry::Type2(entry) if matches!(entry.pe_type, PEType::Uki) => {
-                let mut reader = match &entry.file {
-                    RegularFile::External(id, ..) | RegularFile::ExternalNoVerity(id, ..) => {
-                        std::fs::File::from(repo.open_object(id)?)
-                    }
-                    RegularFile::Inline(..) | RegularFile::Sparse(..) => {
-                        anyhow::bail!("UKI file is not a regular external object")
-                    }
-                };
-                (
-                    uki::get_cmdline_buffered(&mut reader).context("Getting UKI cmdline")?,
-                    uki_file_name(&entry.file_path)?,
-                )
-            }
+            ComposefsBootEntry::Type2(entry) if matches!(entry.pe_type, PEType::Uki) => (
+                read_uki_cmdline(repo, &entry.file)?,
+                uki_file_name(&entry.file_path)?,
+            ),
             _ => continue,
         };
         let candidates = parse_uki_composefs_candidates(&cmdline)
@@ -2190,7 +2285,8 @@ pub(crate) fn setup_composefs_uki_boot(
 
     // Create a `ESP/loader/addons.staged` if we have Global UKI Addons to update
     if is_upgrade {
-        stage_global_uki_addons(&esp_mount.fd)?;
+        let replaced = replaced_global_addons(&entries_to_write)?;
+        stage_global_uki_addons(&esp_mount.fd, &replaced)?;
     }
 
     for entry in entries_to_write {
@@ -2556,6 +2652,7 @@ fn validate_aboot_composefs_candidates(
     cmdline: &str,
     allow_missing_fsverity: bool,
 ) -> Result<()> {
+    crate::bootc_composefs::kmods::ensure_no_kmods_pin(cmdline, "the aboot image's cmdline")?;
     let candidates = parse_uki_composefs_candidates(cmdline)
         .context("Parsing composefs kernel arguments in aboot image")?;
     let insecure = uki_candidates_policy(&candidates)?;
@@ -2987,6 +3084,246 @@ mod tests {
     use super::*;
     use composefs::erofs::format::FormatVersion;
     use composefs_boot::bootloader::{AbootArtifact, AbootEncoding, AbootEntry, Type2Entry};
+
+    /// Whether an addon's cmdline is accepted. Whether the image ships
+    /// modules doesn't matter here: with modules, install already refuses an
+    /// image whose UKI doesn't pin them (see `kmods::expected_kmods_pin`), and
+    /// a pin in the UKI too would be a duplicate at boot; without modules,
+    /// the addon's pin would name an image that was never written.
+    #[test]
+    fn uki_addon_cannot_pin_kmods() {
+        let pin = kmods_pin();
+        let pin_and_composefs = format!(
+            "{pin} {KARG_COMPOSEFS_DIGEST}=v1-sha512-12:{}",
+            "cd".repeat(64)
+        );
+        let cases = [
+            (PEType::UkiAddon, "quiet", true),
+            (PEType::GlobalUkiAddon, "quiet", true),
+            (PEType::UkiAddon, pin.as_str(), false),
+            (PEType::GlobalUkiAddon, pin.as_str(), false),
+            (PEType::UkiAddon, pin_and_composefs.as_str(), false),
+        ];
+        for (pe_type, cmdline, ok) in cases {
+            let mut uki_info = UKIInfo {
+                boot_label: "".into(),
+                version: None,
+                os_id: None,
+                boot_digest: "".into(),
+                composefs_digest: None,
+            };
+            let res = parse_uki_cmdline(
+                &pe_type,
+                false,
+                &ExpectedBootImageIds::default(),
+                &mut std::io::Cursor::new(bootc_utils::create_pe_with_cmdline(cmdline.as_bytes())),
+                "test.addon.efi",
+                &mut uki_info,
+            );
+            assert_eq!(res.is_ok(), ok, "{pe_type:?} {cmdline}: {res:?}");
+            if !ok {
+                assert!(
+                    format!("{:#}", res.unwrap_err()).contains("only the UKI itself"),
+                    "{pe_type:?} {cmdline}"
+                );
+            }
+            assert!(uki_info.composefs_digest.is_none());
+        }
+    }
+
+    fn kmods_pin() -> String {
+        format!("{}={}", bootc_initramfs_setup::KARG_KMODS, "ab".repeat(64))
+    }
+
+    /// A pin from kargs.d, `install --karg` or the booted entry's options must
+    /// not reach a Type 1 entry: `compute_new_kargs` is what the Type 1 setup
+    /// uses for its final kernel arguments.
+    #[test]
+    fn bls_kargs_cannot_pin_kmods() -> Result<()> {
+        let pin = kmods_pin();
+        let rw_pin = format!("rw {pin}");
+        // (kargs.d of the new image, kernel arguments so far, accepted)
+        let cases = [
+            (r#"kargs = ["nosmt"]"#.to_string(), "rw", true),
+            (format!(r#"kargs = ["nosmt", "{pin}"]"#), "rw", false),
+            (r#"kargs = ["nosmt"]"#.to_string(), rw_pin.as_str(), false),
+        ];
+        for (kargsd, cmdline, ok) in cases {
+            let root = cap_std_ext::cap_tempfile::tempdir(ambient_authority())?;
+            root.create_dir_all("usr/lib/bootc/kargs.d")?;
+            root.write("usr/lib/bootc/kargs.d/10-test.toml", &kargsd)?;
+            let mut cmdline = Cmdline::from(cmdline.to_string());
+            let res = compute_new_kargs(&root, None, &mut cmdline);
+            assert_eq!(res.is_ok(), ok, "{kargsd} / {cmdline}: {res:?}");
+            if ok {
+                assert!(cmdline.find("nosmt").is_some(), "{cmdline}");
+            } else {
+                assert!(format!("{:#}", res.unwrap_err()).contains("Type 1 (BLS)"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Global addons on the ESP are checked before they are carried over to a
+    /// new deployment: one with a pin, or that can't be parsed, is refused
+    /// whatever the case of its suffix; the ones the new image replaces are
+    /// neither checked nor copied, whatever their case, while the others still
+    /// are; and a refusal keeps what an earlier upgrade staged.
+    #[test]
+    fn staged_global_addons_cannot_pin_kmods() -> Result<()> {
+        let pin = kmods_pin();
+        let pinned = bootc_utils::create_pe_with_cmdline(pin.as_bytes());
+        let clean = bootc_utils::create_pe_with_cmdline(b"quiet");
+        let good = get_global_uki_addon_name("good");
+        let managed = get_global_uki_addon_name("bad");
+        let other = get_global_uki_addon_name("other");
+        let mixed_case = managed.replace(EFI_ADDON_FILE_EXT, ".ADDON.EFI");
+        let by_hand =
+            |name: &str| format!("remove {GLOBAL_UKI_ADDONS_DIR}/{name} from the ESP by hand");
+        let hint = |name: &str| format!("`bootc uki-addon remove {name} global`");
+        // (live addons besides `good`, replaced by the new image, then either
+        // the addons staged or the expected error and the addon it names)
+        type Case<'a> = (
+            Vec<(&'a str, Vec<u8>)>,
+            Vec<String>,
+            std::result::Result<Vec<&'a str>, (String, &'a str)>,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                vec![(managed.as_str(), clean.clone())],
+                vec![],
+                Ok(vec![good.as_str(), managed.as_str()]),
+            ),
+            (
+                vec![(managed.as_str(), pinned.clone())],
+                vec![],
+                Err((hint("bad"), managed.as_str())),
+            ),
+            (
+                vec![(mixed_case.as_str(), pinned.clone())],
+                vec![],
+                Err((by_hand(mixed_case.as_str()), mixed_case.as_str())),
+            ),
+            (
+                vec![("bad.addon.efi", pinned.clone())],
+                vec![],
+                Err((by_hand("bad.addon.efi"), "bad.addon.efi")),
+            ),
+            // Replaced: the pinned live copy is neither refused nor staged
+            (
+                vec![(managed.as_str(), pinned.clone())],
+                vec![managed.clone()],
+                Ok(vec![good.as_str()]),
+            ),
+            (
+                vec![(mixed_case.as_str(), pinned.clone())],
+                vec![managed.clone()],
+                Ok(vec![good.as_str()]),
+            ),
+            // Another pinned addon is still refused
+            (
+                vec![
+                    (managed.as_str(), pinned.clone()),
+                    (other.as_str(), pinned.clone()),
+                ],
+                vec![managed.clone()],
+                Err((hint("other"), other.as_str())),
+            ),
+            (
+                vec![(managed.as_str(), b"not a PE".to_vec())],
+                vec![],
+                Err(("Reading the cmdline".to_string(), managed.as_str())),
+            ),
+        ];
+        let earlier = get_global_uki_addon_name("earlier");
+        for (live, replaced, expected) in cases {
+            let esp = cap_std_ext::cap_tempfile::tempdir(ambient_authority())?;
+            esp.create_dir_all(GLOBAL_UKI_ADDONS_DIR)?;
+            let addons = esp.open_dir(GLOBAL_UKI_ADDONS_DIR)?;
+            addons.write(&good, &clean)?;
+            for (name, content) in &live {
+                addons.write(name, content)?;
+            }
+            // Staged by an earlier, still pending upgrade
+            esp.create_dir_all(STAGED_GLOBAL_UKI_ADDONS_DIR)?;
+            esp.write(
+                format!("{STAGED_GLOBAL_UKI_ADDONS_DIR}/{earlier}"),
+                b"earlier",
+            )?;
+
+            let what = format!(
+                "{:?} {replaced:?}",
+                live.iter().map(|(n, _)| n).collect::<Vec<_>>()
+            );
+            let res = stage_global_uki_addons(&esp, &replaced);
+            let staged = esp.open_dir(STAGED_GLOBAL_UKI_ADDONS_DIR)?;
+            let mut staged_names = staged
+                .entries_utf8()?
+                .map(|ent| Ok(ent?.file_name()?))
+                .collect::<Result<Vec<String>>>()?;
+            staged_names.sort();
+            match expected {
+                Ok(mut expected) => {
+                    assert!(res.is_ok(), "{what}: {res:?}");
+                    expected.sort();
+                    assert_eq!(staged_names, expected, "{what}");
+                }
+                Err((message, named)) => {
+                    let err = format!("{:#}", res.unwrap_err());
+                    assert!(err.contains(&message), "{what}: {err}");
+                    assert!(
+                        err.contains(&format!("{GLOBAL_UKI_ADDONS_DIR}/{named}")),
+                        "{what}: {err}"
+                    );
+                    if message.starts_with("Reading") {
+                        // No removal hint for what isn't a pin
+                        assert!(
+                            !err.contains("Remove it") && !err.contains("by hand"),
+                            "{err}"
+                        );
+                    }
+                    // Nothing new is staged, and the earlier staging is kept
+                    assert_eq!(staged_names, vec![earlier.clone()], "{what}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// On upgrade, the global addons that the new image writes itself are the
+    /// ones left out of the carried-over copies, under their ESP names.
+    #[test]
+    fn replaced_global_addons_are_the_image_global_addons() -> Result<()> {
+        let entry = |path: &str, pe_type| Type2Entry {
+            kver: None,
+            file_path: path.into(),
+            file: RegularFile::Inline(Default::default()),
+            pe_type,
+        };
+        let entries = [
+            entry("EFI/Linux/test.efi", PEType::Uki),
+            entry(
+                "EFI/Linux/test.efi.extra.d/scoped.addon.efi",
+                PEType::UkiAddon,
+            ),
+            entry("EFI/Linux/global.addon.efi", PEType::GlobalUkiAddon),
+        ];
+        let replaced = replaced_global_addons(&entries)?;
+        let global = get_global_uki_addon_name("global");
+        assert_eq!(replaced, vec![global.clone()]);
+
+        // The pinned live copy that the image's global addon replaces doesn't
+        // block the upgrade
+        let esp = cap_std_ext::cap_tempfile::tempdir(ambient_authority())?;
+        esp.create_dir_all(GLOBAL_UKI_ADDONS_DIR)?;
+        esp.write(
+            format!("{GLOBAL_UKI_ADDONS_DIR}/{global}"),
+            bootc_utils::create_pe_with_cmdline(kmods_pin().as_bytes()),
+        )?;
+        stage_global_uki_addons(&esp, &replaced)?;
+        assert!(!esp.try_exists(format!("{STAGED_GLOBAL_UKI_ADDONS_DIR}/{global}"))?);
+        Ok(())
+    }
 
     #[test]
     fn aboot_disk_layout_matches_pulled_artifact() {
@@ -3440,6 +3777,9 @@ mod tests {
             uki_v2(v2.clone(), false)
         );
         assert!(validate_aboot_composefs_candidates(&v1, &ids, &dual, false).is_ok());
+        // Only a UKI may pin a kernel modules image
+        let pinned = format!("{dual} {}", kmods_pin());
+        assert!(validate_aboot_composefs_candidates(&v1, &ids, &pinned, false).is_err());
         let stale_fallback = format!(
             "{} {}",
             uki_v1(v1.clone(), false),
