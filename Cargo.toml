@@ -134,3 +134,8 @@ todo = "deny"
 needless_borrow = "allow"
 needless_borrows_for_generic_args = "allow"
 
+
+# Proof of concept only: composefs-rs with image sets, from
+# https://github.com/jmarrero-forge/composefs-rs/pull/1
+[patch.crates-io]
+composefs-ctl = { git = "https://github.com/jmarrero-forge/composefs-rs", branch = "bot/multi-erofs-manifest" }

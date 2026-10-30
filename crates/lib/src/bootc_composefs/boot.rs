@@ -1198,6 +1198,9 @@ fn parse_uki_composefs_candidates(cmdline: &str) -> Result<Vec<UkiComposefsCandi
             Some(ComposefsBootCmdline::V2 { digest, insecure }) => {
                 (digest, insecure, UkiCandidateFormat::V2)
             }
+            Some(ComposefsBootCmdline::ImageSet { .. }) => {
+                anyhow::bail!("Image set digests in boot artifacts are not supported yet")
+            }
         };
         candidates.push(UkiComposefsCandidate {
             digest,
