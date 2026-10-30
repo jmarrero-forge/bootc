@@ -128,17 +128,41 @@ fn reconcile_composefs_cmdline_with_mount_source(
     Ok(cmdline)
 }
 
-/// Render a composefs karg that identifies the EROFS format of `digest`.
+/// What a deployment's composefs digest names, which decides how its karg is spelled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootFormat {
+    /// A single EROFS image of this format.
+    Image(FormatVersion),
+    /// An image set (see [`crate::bootc_composefs::image_set`]).
+    ImageSet,
+}
+
+impl From<FormatVersion> for RootFormat {
+    fn from(version: FormatVersion) -> Self {
+        RootFormat::Image(version)
+    }
+}
+
+/// Render a composefs karg that identifies what `digest` names: an image of
+/// a given EROFS format, or an image set.
 pub(crate) fn build_composefs_karg(
     digest: Sha512HashValue,
-    format_version: FormatVersion,
+    format: impl Into<RootFormat>,
     allow_missing_fsverity: bool,
 ) -> String {
-    match format_version {
-        FormatVersion::V0 | FormatVersion::V1 => {
+    match format.into() {
+        RootFormat::Image(FormatVersion::V0 | FormatVersion::V1) => {
             BootComposefsCmdline::new_v1(digest, allow_missing_fsverity)
         }
-        FormatVersion::V2 => BootComposefsCmdline::new_v2(digest, allow_missing_fsverity),
+        RootFormat::Image(FormatVersion::V2) => {
+            BootComposefsCmdline::new_v2(digest, allow_missing_fsverity)
+        }
+        // A bootc that predates image sets fails to parse this, and with it
+        // status (so upgrade, rollback and GC) whenever a set deployment's
+        // BLS entry is present, and its initramfs refuses the repository
+        // once a set is in it.  See the compatibility notes in
+        // crate::bootc_composefs::image_set.
+        RootFormat::ImageSet => BootComposefsCmdline::new_image_set(digest, allow_missing_fsverity),
     }
     .to_cmdline_arg()
 }
@@ -1522,15 +1546,20 @@ mod tests {
             build_composefs_karg(digest(), FormatVersion::V2, true),
             format!("composefs=?{hex}")
         );
-
-        let cmdline = Cmdline::from(format!("composefs.digest=v1-sha512-12:{hex}"));
         assert_eq!(
-            ComposefsCmdline::find_in_cmdline(&cmdline)?
-                .expect("composefs argument should be present")
-                .digest
-                .as_ref(),
-            hex
+            build_composefs_karg(digest(), RootFormat::ImageSet, false),
+            format!("composefs.digest=set1-sha512-12:{hex}")
         );
+
+        // An image set's digest is the deployment's, like an image's
+        for karg in [
+            format!("composefs.digest=v1-sha512-12:{hex}"),
+            format!("composefs.digest=set1-sha512-12:{hex}"),
+        ] {
+            let parsed = ComposefsCmdline::find_in_cmdline(&Cmdline::from(karg.as_str()))?
+                .expect("composefs argument should be present");
+            assert_eq!(parsed.digest.as_ref(), hex, "{karg}");
+        }
 
         Ok(())
     }

@@ -64,7 +64,7 @@
 use std::cell::Cell;
 use std::fs::create_dir_all;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -103,7 +103,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::bootc_composefs::state::{get_booted_bls, write_composefs_state};
-use crate::bootc_composefs::status::build_composefs_karg;
+use crate::bootc_composefs::status::{RootFormat, build_composefs_karg};
 use crate::bootc_composefs::uki_addon::{UkiAddonType, UkiAddonsList, list_installed_uki_addons};
 use crate::bootc_kargs::compute_new_kargs;
 use crate::composefs_consts::{
@@ -823,7 +823,7 @@ pub(crate) fn setup_composefs_bls_boot(
     setup_type: BootSetupType,
     repo: &crate::store::ComposefsRepository,
     id: &Sha512HashValue,
-    format_version: FormatVersion,
+    root_format: RootFormat,
     entry: &ComposefsBootEntry<Sha512HashValue>,
     mounted_erofs: &Dir,
 ) -> Result<String> {
@@ -843,7 +843,7 @@ pub(crate) fn setup_composefs_bls_boot(
             }
 
             let composefs_cmdline =
-                build_composefs_karg(id.clone(), format_version, allow_missing_fsverity);
+                build_composefs_karg(id.clone(), root_format, allow_missing_fsverity);
             cmdline_options.extend(&Cmdline::from(&composefs_cmdline));
 
             // If there's a separate /boot partition, add a systemd.mount-extra
@@ -896,7 +896,7 @@ pub(crate) fn setup_composefs_bls_boot(
                 &mut cmdline,
                 &build_composefs_karg(
                     id.clone(),
-                    format_version,
+                    root_format,
                     booted_cfs.cmdline.allow_missing_fsverity,
                 ),
             )?;
@@ -2854,6 +2854,7 @@ pub(crate) async fn setup_composefs_boot(
 
     let crate::bootc_composefs::repo::BootImage {
         id,
+        root_format,
         boot_ids,
         fs,
         entries,
@@ -2869,9 +2870,7 @@ pub(crate) async fn setup_composefs_boot(
         validate_aboot_disk_layout(encoding, root_setup.aboot_disk_layout)?;
     }
 
-    let composefs_mnt_fd = repo
-        .mount(&id.to_hex())
-        .context("Failed to mount composefs image")?;
+    let composefs_mnt_fd = mount_composefs_root(&repo, &id.to_hex(), root_format)?;
     let image_root = Dir::reopen_dir(&composefs_mnt_fd)?;
 
     let postfetch = PostFetchState::new(state, &image_root, image_bootloader(entry))?;
@@ -2896,7 +2895,7 @@ pub(crate) async fn setup_composefs_boot(
         )
     })?;
 
-    let (provisional_deploy_id, provisional_format) = (id.clone(), repo.erofs_version());
+    let (provisional_deploy_id, provisional_format) = (id.clone(), root_format);
     let (boot_digest, deploy_id) = match boot_type {
         BootType::Bls => (
             setup_composefs_bls_boot(
@@ -2962,6 +2961,19 @@ pub(crate) async fn setup_composefs_boot(
     }
 
     Ok(())
+}
+
+/// Mount the root of a deployment, an image or an image set.
+pub(crate) fn mount_composefs_root(
+    repo: &crate::store::ComposefsRepository,
+    name: &str,
+    root_format: RootFormat,
+) -> Result<OwnedFd> {
+    match root_format {
+        RootFormat::Image(_) => repo.mount(name),
+        RootFormat::ImageSet => repo.mount_image_set(name),
+    }
+    .context("Failed to mount composefs image")
 }
 
 /// Associate every accepted boot image with its EROFS serialization format.
