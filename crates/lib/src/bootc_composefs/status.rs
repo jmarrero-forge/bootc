@@ -10,7 +10,7 @@ use composefs_ctl::composefs_boot::cmdline::{
 use composefs_ctl::composefs_oci;
 use composefs_oci::OciImage;
 use fn_error_context::context;
-use linux_kernel_cmdline::utf8::Cmdline;
+use linux_kernel_cmdline::utf8::{Cmdline, Parameter};
 use openssl::sha::Sha256;
 use serde::{Deserialize, Serialize};
 
@@ -128,17 +128,41 @@ fn reconcile_composefs_cmdline_with_mount_source(
     Ok(cmdline)
 }
 
-/// Render a composefs karg that identifies the EROFS format of `digest`.
+/// What a deployment's composefs digest names, which decides how its karg is spelled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootFormat {
+    /// A single EROFS image of this format.
+    Image(FormatVersion),
+    /// An image set (see [`crate::bootc_composefs::image_set`]).
+    ImageSet,
+}
+
+impl From<FormatVersion> for RootFormat {
+    fn from(version: FormatVersion) -> Self {
+        RootFormat::Image(version)
+    }
+}
+
+/// Render a composefs karg that identifies what `digest` names: an image of
+/// a given EROFS format, or an image set.
 pub(crate) fn build_composefs_karg(
     digest: Sha512HashValue,
-    format_version: FormatVersion,
+    format: impl Into<RootFormat>,
     allow_missing_fsverity: bool,
 ) -> String {
-    match format_version {
-        FormatVersion::V0 | FormatVersion::V1 => {
+    match format.into() {
+        RootFormat::Image(FormatVersion::V0 | FormatVersion::V1) => {
             BootComposefsCmdline::new_v1(digest, allow_missing_fsverity)
         }
-        FormatVersion::V2 => BootComposefsCmdline::new_v2(digest, allow_missing_fsverity),
+        RootFormat::Image(FormatVersion::V2) => {
+            BootComposefsCmdline::new_v2(digest, allow_missing_fsverity)
+        }
+        // A bootc that predates image sets fails to parse this, and with it
+        // status (so upgrade, rollback and GC) whenever a set deployment's
+        // BLS entry is present, and its initramfs refuses the repository
+        // once a set is in it.  See the compatibility notes in
+        // crate::bootc_composefs::image_set.
+        RootFormat::ImageSet => BootComposefsCmdline::new_image_set(digest, allow_missing_fsverity),
     }
     .to_cmdline_arg()
 }
@@ -751,25 +775,21 @@ fn find_bls_entry<'a>(
     Ok(None)
 }
 
-/// Compares cmdline `first` and `second` skipping either composefs karg spelling.
-fn compare_cmdline_skip_cfs(first: &Cmdline<'_>, second: &Cmdline<'_>) -> bool {
-    for param in first {
-        if param.key() == KARG_V2.into() || param.key() == KARG_COMPOSEFS_DIGEST.into() {
-            continue;
-        }
-
-        let second_param = second.iter().find(|b| *b == param);
-
-        let Some(found_param) = second_param else {
+/// Whether cmdlines `first` and `second` have the same arguments, in any order,
+/// apart from the composefs karg (in either spelling), which names the
+/// deployment and so always differs.
+fn cmdline_eq_skip_cfs(first: &Cmdline<'_>, second: &Cmdline<'_>) -> bool {
+    let is_cfs = |param: &Parameter<'_>| {
+        param.key() == KARG_V2.into() || param.key() == KARG_COMPOSEFS_DIGEST.into()
+    };
+    let mut unmatched: Vec<_> = second.iter().filter(|param| !is_cfs(param)).collect();
+    for param in first.iter().filter(|param| !is_cfs(param)) {
+        let Some(pos) = unmatched.iter().position(|other| *other == param) else {
             return false;
         };
-
-        if found_param.value() != param.value() {
-            return false;
-        }
+        unmatched.swap_remove(pos);
     }
-
-    return true;
+    unmatched.is_empty()
 }
 
 #[context("Setting soft reboot capability for Type1 entries")]
@@ -845,18 +865,12 @@ fn is_soft_rebootable(
         return Ok(false);
     }
 
-    if target.full_cmdline.as_bytes().len() != booted.full_cmdline.as_bytes().len() {
+    if !cmdline_eq_skip_cfs(target.full_cmdline, booted.full_cmdline) {
         tracing::debug!("Soft reboot not allowed due to differing cmdline");
         return Ok(false);
     }
 
-    let cmdline_eq = compare_cmdline_skip_cfs(target.full_cmdline, booted.full_cmdline)
-        && compare_cmdline_skip_cfs(booted.full_cmdline, target.full_cmdline);
-
-    let selinux_compatible =
-        are_selinux_policies_compatible(storage, booted_cmdline, target.verity)?;
-
-    return Ok(cmdline_eq && selinux_compatible);
+    are_selinux_policies_compatible(storage, booted_cmdline, target.verity)
 }
 
 #[context("Setting soft reboot capability for UKI deployments")]
@@ -1532,15 +1546,20 @@ mod tests {
             build_composefs_karg(digest(), FormatVersion::V2, true),
             format!("composefs=?{hex}")
         );
-
-        let cmdline = Cmdline::from(format!("composefs.digest=v1-sha512-12:{hex}"));
         assert_eq!(
-            ComposefsCmdline::find_in_cmdline(&cmdline)?
-                .expect("composefs argument should be present")
-                .digest
-                .as_ref(),
-            hex
+            build_composefs_karg(digest(), RootFormat::ImageSet, false),
+            format!("composefs.digest=set1-sha512-12:{hex}")
         );
+
+        // An image set's digest is the deployment's, like an image's
+        for karg in [
+            format!("composefs.digest=v1-sha512-12:{hex}"),
+            format!("composefs.digest=set1-sha512-12:{hex}"),
+        ] {
+            let parsed = ComposefsCmdline::find_in_cmdline(&Cmdline::from(karg.as_str()))?
+                .expect("composefs argument should be present");
+            assert_eq!(parsed.digest.as_ref(), hex, "{karg}");
+        }
 
         Ok(())
     }
@@ -1919,6 +1938,41 @@ mod tests {
         assert_eq!(result, expected);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_cmdline_eq_skip_cfs() {
+        let hex = "ab".repeat(64);
+        let base = "root=UUID=1 rw console=ttyS0 console=hvc0";
+        let v2 = format!("composefs={hex} {base}");
+        let v1 = format!("{base} composefs.digest=v1-sha512-12:{hex}");
+        let cases = [
+            (v2.as_str(), v1.as_str(), true),
+            (v2.as_str(), base, true),
+            (base, "console=hvc0 rw console=ttyS0 root=UUID=1", true),
+            (base, "root-UUID=1 rw console=ttyS0 console=hvc0", false),
+            (base, "root=UUID=1 rw console=ttyS0", false),
+            (
+                base,
+                "root=UUID=1 rw console=ttyS0 console=hvc0 console=hvc0",
+                false,
+            ),
+            (base, "root=UUID=2 rw console=ttyS0 console=hvc0", false),
+            ("a-b=1 rw", "a_b=1 rw", true),
+        ];
+        for (first, second, expected) in cases {
+            let (first, second) = (Cmdline::from(first), Cmdline::from(second));
+            assert_eq!(
+                cmdline_eq_skip_cfs(&first, &second),
+                expected,
+                "{first} / {second}"
+            );
+            assert_eq!(
+                cmdline_eq_skip_cfs(&second, &first),
+                expected,
+                "{second} / {first}"
+            );
+        }
     }
 
     #[test]

@@ -185,12 +185,21 @@ pub(crate) fn validate_update(
         Some(config_verity),
         &composefs_oci::OciTransformOptions::default(),
     )?;
+    let image_set_parts = crate::bootc_composefs::image_set::boot_image_set_parts(&fs, repo)?;
     fs.transform_for_boot(&repo)?;
 
-    let image_ids = [
+    let mut image_ids = vec![
         fs.compute_image_id(FormatVersion::V1),
         fs.compute_image_id(FormatVersion::V2),
     ];
+    // An image set deployment is named by the set's digest, the same that
+    // prepare_boot_image() commits
+    if let Some(parts) = image_set_parts {
+        image_ids.push(crate::bootc_composefs::image_set::compute_image_set_id(
+            &parts,
+            repo.erofs_version(),
+        )?);
+    }
 
     let all_deployments = host.all_composefs_deployments()?;
 
@@ -335,6 +344,7 @@ pub(crate) async fn do_upgrade(
         repo,
         entries,
         id,
+        root_format,
         boot_ids,
         manifest_digest,
         fs: oci_fs,
@@ -384,11 +394,11 @@ pub(crate) async fn do_upgrade(
         );
     }
 
-    let mounted_fs = Dir::reopen_dir(
-        &repo
-            .mount(&id.to_hex())
-            .context("Failed to mount composefs image")?,
-    )?;
+    let mounted_fs = Dir::reopen_dir(&super::boot::mount_composefs_root(
+        &repo,
+        &id.to_hex(),
+        root_format,
+    )?)?;
 
     // Check if three way etc merge is possible without conflicts
     let new_etc = mounted_fs
@@ -402,7 +412,7 @@ pub(crate) async fn do_upgrade(
         anyhow::bail!("Merge conflicts found in etc");
     }
 
-    let (provisional_deploy_id, provisional_format) = (id.clone(), repo.erofs_version());
+    let (provisional_deploy_id, provisional_format) = (id.clone(), root_format);
     let mut aboot_artifacts = None;
 
     let (boot_digest, deploy_id) = match boot_type {

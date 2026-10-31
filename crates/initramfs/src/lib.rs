@@ -349,18 +349,10 @@ fn open_root_fs(path: &Path) -> Result<OwnedFd> {
     Ok(rootfs)
 }
 
-/// Prepares a floating mount for composefs and returns the fd
-///
-/// # Arguments
-/// * sysroot                - fd for /sysroot
-/// * name                   - Name of the EROFS image to be mounted
-/// * allow_missing_fsverity - Whether to allow mount without fsverity support
-#[context("Mounting composefs image")]
-pub fn mount_composefs_image(
+fn open_composefs_repo(
     sysroot: &OwnedFd,
-    name: &str,
     allow_missing_fsverity: bool,
-) -> Result<OwnedFd> {
+) -> Result<Repository<Sha512HashValue>> {
     // Use open_upgrade to handle upgrades from older composefs-rs versions
     // that lack meta.json: it infers the algorithm and verity mode from
     // existing objects, writes meta.json, and opens normally.
@@ -368,13 +360,67 @@ pub fn mount_composefs_image(
     if allow_missing_fsverity {
         repo.set_insecure();
     }
-    let rootfs = repo
-        .mount(name)
-        .context("Failed to mount composefs image")?;
+    Ok(repo)
+}
+
+/// What a composefs digest names: one EROFS image, or an image set whose
+/// component images are stacked into one tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComposefsRootKind {
+    /// A single EROFS image.
+    Image,
+    /// An image set manifest.
+    ImageSet,
+}
+
+impl ComposefsRootKind {
+    /// What the deployment `name` of `repo` is.
+    ///
+    /// Deployments are named by their composefs digest; one of an image set is
+    /// the digest of its manifest, found under `image-sets/` in the repository.
+    /// Any error but a missing manifest is one, so that a broken set is never
+    /// mistaken for an image.
+    #[context("Looking up composefs deployment {name}")]
+    pub fn of_deployment(repo: &Repository<Sha512HashValue>, name: &str) -> Result<Self> {
+        match repo.open_image_set(name) {
+            Ok(_) => Ok(Self::ImageSet),
+            Err(error) if error.downcast_ref::<ImageNotFound>().is_some() => Ok(Self::Image),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn mount_composefs_root(
+    repo: &Repository<Sha512HashValue>,
+    name: &str,
+    kind: ComposefsRootKind,
+) -> Result<OwnedFd> {
+    let rootfs = match kind {
+        ComposefsRootKind::Image => repo.mount(name),
+        ComposefsRootKind::ImageSet => repo.mount_image_set(name),
+    }
+    .context("Failed to mount composefs image")?;
 
     set_mount_readonly(&rootfs)?;
 
     Ok(rootfs)
+}
+
+/// Prepares a floating mount for composefs and returns the fd
+///
+/// # Arguments
+/// * sysroot                - fd for /sysroot
+/// * name                   - Digest of the EROFS image or image set to be mounted
+/// * allow_missing_fsverity - Whether to allow mount without fsverity support
+#[context("Mounting composefs image")]
+pub fn mount_composefs_image(
+    sysroot: &OwnedFd,
+    name: &str,
+    allow_missing_fsverity: bool,
+) -> Result<OwnedFd> {
+    let repo = open_composefs_repo(sysroot, allow_missing_fsverity)?;
+    let kind = ComposefsRootKind::of_deployment(&repo, name)?;
+    mount_composefs_root(&repo, name, kind)
 }
 
 fn parse_composefs_candidates(cmdline: &str) -> Result<Vec<ComposefsCmdline<Sha512HashValue>>> {
@@ -407,6 +453,13 @@ fn parse_composefs_candidates(cmdline: &str) -> Result<Vec<ComposefsCmdline<Sha5
             candidates.push(candidate);
         }
     }
+    // Alternative candidates exist for the V1/V2 encodings of one tree.  An
+    // image set already pins all of its tree, and the deployment is named by
+    // its digest, so there's nothing it could fall back to.
+    anyhow::ensure!(
+        candidates.len() <= 1 || !candidates.iter().any(|c| c.is_image_set()),
+        "an image set must be the only composefs digest on the kernel command line"
+    );
     Ok(candidates)
 }
 
@@ -441,11 +494,13 @@ fn mount_composefs_candidate(
         );
     }
 
-    match mount_composefs_image(
-        sysroot,
-        &candidate.digest().to_hex(),
-        allow_missing_fsverity,
-    ) {
+    let kind = if candidate.is_image_set() {
+        ComposefsRootKind::ImageSet
+    } else {
+        ComposefsRootKind::Image
+    };
+    let repo = open_composefs_repo(sysroot, allow_missing_fsverity)?;
+    match mount_composefs_root(&repo, &candidate.digest().to_hex(), kind) {
         Ok(rootfs) => Ok(Some(rootfs)),
         Err(error) if error.downcast_ref::<ImageNotFound>().is_some() => Ok(None),
         Err(error) => Err(error),
@@ -740,6 +795,49 @@ mod tests {
 
     fn v2(digest: Sha512HashValue, insecure: bool) -> String {
         ComposefsCmdline::new_v2(digest, insecure).to_cmdline_arg()
+    }
+
+    fn set(digest: Sha512HashValue, insecure: bool) -> String {
+        ComposefsCmdline::new_image_set(digest, insecure).to_cmdline_arg()
+    }
+
+    #[test]
+    fn test_composefs_image_set_candidate() {
+        let digest = Sha512HashValue::from_hex("aa".repeat(64)).unwrap();
+        for insecure in [false, true] {
+            let candidates =
+                parse_composefs_candidates(&format!("quiet {} rw", set(digest.clone(), insecure)))
+                    .unwrap();
+            assert_eq!(
+                candidates,
+                [ComposefsCmdline::new_image_set(digest.clone(), insecure)]
+            );
+        }
+
+        let other = Sha512HashValue::EMPTY;
+        for cmdline in [
+            format!(
+                "{} {}",
+                set(digest.clone(), false),
+                v1(other.clone(), false)
+            ),
+            format!(
+                "{} {}",
+                v2(other.clone(), false),
+                set(digest.clone(), false)
+            ),
+            format!(
+                "{} {}",
+                set(digest.clone(), false),
+                set(other.clone(), false)
+            ),
+        ] {
+            let err = parse_composefs_candidates(&cmdline).unwrap_err();
+            assert!(
+                err.to_string().contains("image set must be the only"),
+                "{cmdline}: {err:#}"
+            );
+        }
     }
 
     #[test]

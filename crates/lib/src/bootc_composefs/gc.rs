@@ -319,6 +319,31 @@ fn orphaned_state_dirs<'a>(
         .collect()
 }
 
+/// The dumpfile lines of the `/boot` of the EROFS image `image`, or `None` if
+/// it has nothing there.
+fn image_boot_dump(
+    booted_cfs: &BootedComposefs,
+    image: &Sha512HashValue,
+) -> Result<Option<Vec<u8>>> {
+    let boot_dump = composefs_ctl::dump_files(
+        &booted_cfs.repo,
+        &image.to_hex(),
+        &vec![std::path::Path::new("/").join(crate::install::BOOT)],
+        false,
+    )
+    .context("Getting dump for /boot")?;
+
+    if boot_dump.is_empty() {
+        tracing::debug!("Nothing found in /boot in non-bootable image");
+        return Ok(None);
+    }
+
+    Ok(Some(boot_dump))
+}
+
+/// The `/boot` of the non-bootable image of the orphaned deployment `verity`,
+/// found through the OCI image whose boot image it is.  `None` if that can't
+/// be found: an orphan's boot objects are then left alone.
 fn get_boot_dump(booted_cfs: &BootedComposefs, verity: &str) -> Result<Option<Vec<u8>>> {
     let verity_to_sha = Sha512HashValue::from_hex(verity);
 
@@ -344,20 +369,37 @@ fn get_boot_dump(booted_cfs: &BootedComposefs, verity: &str) -> Result<Option<Ve
         return Ok(None);
     };
 
-    let boot_dump = composefs_ctl::dump_files(
-        &booted_cfs.repo,
-        &non_bootable_img.id.to_hex(),
-        &vec![std::path::Path::new("/").join(crate::install::BOOT)],
-        false,
-    )
-    .context("Getting dump for /boot")?;
+    image_boot_dump(booted_cfs, &non_bootable_img.id)
+}
 
-    if boot_dump.is_empty() {
-        tracing::debug!("Nothing found in /boot in non-bootable image");
-        return Ok(None);
-    }
-
-    Ok(Some(boot_dump))
+/// The `/boot` of the non-bootable image of the live deployment `verity`,
+/// whose OCI manifest is `manifest` if known.  Unlike [`get_boot_dump`],
+/// failing to find it is an error: without it, there's no telling which
+/// objects of an orphan's `/boot` this deployment still uses.
+///
+/// The manifest is looked up first, since that works for image set
+/// deployments too, whose ID is the set's digest and not that of an image
+/// linked from the OCI image.
+fn live_boot_dump(
+    booted_cfs: &BootedComposefs,
+    verity: &str,
+    manifest: Option<&composefs_oci::OciDigest>,
+) -> Result<Option<Vec<u8>>> {
+    let linked_images = match manifest {
+        Some(digest) => composefs_oci::oci_image::OciImage::open(&*booted_cfs.repo, digest, None)
+            .with_context(|| format!("Opening OCI image {digest}"))?
+            .all_erofs_images(),
+        None => {
+            let id = Sha512HashValue::from_hex(verity).context("Parsing deployment ID")?;
+            linked_erofs_images(&booted_cfs.repo, &id)
+                .context("Looking up the OCI image of the deployment")?
+        }
+    };
+    let image = linked_images
+        .iter()
+        .find(|img| !img.bootable)
+        .ok_or_else(|| anyhow::anyhow!("no non-bootable EROFS image found"))?;
+    image_boot_dump(booted_cfs, &image.id)
 }
 
 /// 1. List all bootloader entries
@@ -472,6 +514,21 @@ pub(crate) async fn composefs_gc(
         gc_global_uki_addons(storage, booted_cfs, &gc_opts, &bootloader_entries)?;
     }
 
+    // Each image set deployment's set has a ref of its own, which keeps it
+    // alive through a repository GC without bootc's roots (such as
+    // `bootc internals cfs gc`); restore any that went missing, with or
+    // without --prune-repo.
+    let deployment_ids = host
+        .list_deployments()
+        .into_iter()
+        .map(|deployment| Ok(deployment.require_composefs()?.verity.clone()))
+        .collect::<Result<Vec<_>>>()?;
+    crate::bootc_composefs::image_set::add_missing_deployment_refs(
+        &booted_cfs.repo,
+        &deployment_ids,
+        gc_opts.dry_run,
+    )?;
+
     if !gc_opts.prune_repo {
         return Ok(GcResult::default());
     }
@@ -546,6 +603,10 @@ pub(crate) async fn composefs_gc(
     let mut additional_roots = Vec::new();
     // Container image names for containers-storage pruning.
     let mut live_container_images: std::collections::HashSet<String> = Default::default();
+    // Each live deployment and its OCI manifest, if found, for the
+    // boot-object cleanup below.
+    let mut live_deployments_manifests: Vec<(String, Option<composefs_oci::OciDigest>)> =
+        Vec::new();
 
     // Read existing tags before the deployment loop so we can search
     // them for deployments that lack manifest_digest in their origin.
@@ -565,6 +626,7 @@ pub(crate) async fn composefs_gc(
         // new code, its EROFS image is reachable from the manifest and
         // this entry becomes redundant (but harmless).
         additional_roots.push(verity.clone());
+        let manifests_before = live_manifest_digests.len();
 
         if let Some(ini) = read_origin(sysroot, verity)? {
             // Collect the container image name for containers-storage GC.
@@ -619,6 +681,8 @@ pub(crate) async fn composefs_gc(
                 }
             }
         }
+        let manifest = live_manifest_digests[manifests_before..].first().cloned();
+        live_deployments_manifests.push((verity.clone(), manifest));
     }
 
     // Migration: ensure every live deployment has a bootc-owned tag.
@@ -658,6 +722,14 @@ pub(crate) async fn composefs_gc(
         }
     }
 
+    // Drop the image set refs of deployments that are gone, like the tags
+    // above.
+    crate::bootc_composefs::image_set::remove_stale_deployment_refs(
+        &booted_cfs.repo,
+        &additional_roots,
+        gc_opts.dry_run,
+    )?;
+
     let additional_roots = additional_roots
         .iter()
         .map(|x| x.as_str())
@@ -682,9 +754,18 @@ pub(crate) async fn composefs_gc(
 
     let mut live_objects: HashSet<String> = HashSet::new();
 
-    for verity in &additional_roots {
-        let Some(boot_dump) = get_boot_dump(booted_cfs, verity)? else {
-            continue;
+    // Every object in a live deployment's /boot must survive the cleanup of
+    // orphans' boot objects below, so that cleanup only runs if every live
+    // deployment could be looked at.
+    let mut live_inspection_error = None;
+    for (verity, manifest) in &live_deployments_manifests {
+        let boot_dump = match live_boot_dump(booted_cfs, verity, manifest.as_ref()) {
+            Ok(Some(boot_dump)) => boot_dump,
+            Ok(None) => continue,
+            Err(err) => {
+                live_inspection_error = Some(format!("{verity}: {err:#}"));
+                break;
+            }
         };
 
         let boot_dump = std::str::from_utf8(&boot_dump).context("dumpfile is not UTF-8")?;
@@ -712,7 +793,18 @@ pub(crate) async fn composefs_gc(
     // Now GC the UKI/UKI Addons from `.boot` EROFS if we have them.
     // Aboot artifacts may share repository objects and are left to repository GC.
     // These won't be GC'd by the above `repo.gc` as the EROFS have `/boot` masked.
-    for verity in all_orphans.iter().copied().filter(|_| !is_aboot) {
+    let orphan_boot_cleanup = if is_aboot {
+        false
+    } else if let Some(err) = &live_inspection_error {
+        tracing::warn!(
+            "Not removing the boot objects of orphaned deployments, which live ones may \
+             share: can't inspect the /boot of live deployment {err}"
+        );
+        false
+    } else {
+        true
+    };
+    for verity in all_orphans.iter().copied().filter(|_| orphan_boot_cleanup) {
         let Some(boot_dump) = get_boot_dump(booted_cfs, verity)? else {
             continue;
         };
