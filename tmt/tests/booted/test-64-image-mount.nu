@@ -1,116 +1,190 @@
 # number: 64
 # tmt:
 #   summary: Verify booted and staged deployment image mounts
-#   duration: 10m
+#   duration: 30m
+#
+# Covers `bootc image mount` and `bootc image unmount`: read-only mounts of
+# booted image content, of a staged image after `bootc switch` (no reboot),
+# explicit unmount and the CLI's error cases. On ostree the staged image
+# disables composefs, so it goes through the plain checkout path while the
+# booted deployment uses composefs.
 
 use std assert
+use tap.nu
 
-def assert_mount_options [target] {
+const staged_image = "localhost/bootc-image-mount"
+# Image content only the staged image has, in /opt as in bootc#2433.
+const marker_dir = "/opt/bootc-image-mount-test"
+
+def mount_image [deployment: string, source: string, target: string] {
+    bootc image mount --deployment $deployment --source $source --target $target
+}
+
+# Run bootc with arguments that must fail, and return its stderr.
+def --wrapped bootc_fails [...args] {
+    let result = (do -i { ^bootc ...$args } | complete)
+    assert ($result.exit_code != 0) $"bootc ($args | str join ' ') should fail"
+    $result.stderr
+}
+
+def is_mountpoint [path: string] {
+    (do -i { ^findmnt --mountpoint $path } | complete).exit_code == 0
+}
+
+def assert_mount_options [target: string] {
     let options = (
         findmnt --mountpoint $target --json
         | from json
         | get filesystems.0.options
         | split row ","
     )
-    # findmnt's options field reports these VFS mount options, including nosymfollow.
     for option in [ro nosuid nodev nosymfollow] {
-        assert (
-            $options | any { |value| $value == $option }
-        ) $"($target) should have the ($option) mount option"
+        assert ($option in $options) $"($target) should have the ($option) mount option"
     }
-    assert (not ($options | any { |value| $value == "noexec" })) $"($target) should not have noexec"
+    assert (not ("noexec" in $options)) $"($target) should not have noexec"
 }
 
-def cleanup_targets [targets] {
-    $targets | each { |target|
-        let result = (do -i { bootc image unmount $target } | complete)
-        if $result.exit_code != 0 {
-            $"($target): unmount failed: ($result.stderr); mount target left in place"
-        }
-    } | where { |failure| $failure != null }
+def unmount_image [target: string] {
+    bootc image unmount $target
+    assert (not (is_mountpoint $target)) $"($target) should no longer be a mountpoint"
 }
 
-def mount_image [deployment source target] {
-    let result = (do -i {
-        bootc image mount --deployment $deployment --source $source --target $target
-    } | complete)
-    if $result.exit_code != 0 {
-        error make {
-            msg: $"Failed to mount ($deployment) image source ($source) at ($target): ($result.stderr)"
-        }
-    }
+def test_booted [base: string] {
+    let root = ($base | path join "root")
+    let usr = ($base | path join "usr")
+    mkdir $root $usr
+
+    mount_image booted / $root
+    mount_image booted /usr $usr
+    assert_mount_options $root
+    assert_mount_options $usr
+    assert equal (open --raw ($root | path join "usr/lib/os-release")) (open --raw /usr/lib/os-release)
+    assert equal (open --raw ($usr | path join "lib/os-release")) (open --raw /usr/lib/os-release)
+    assert (not ($root | path join "opt/bootc-image-mount-test" | path exists)) "booted image should not have the staged marker"
+
+    let write_path = ($usr | path join ".bootc-image-mount-write-test")
+    let write_result = (do -i { ^touch $write_path } | complete)
+    assert ($write_result.exit_code != 0) "writes to mounted image content should fail"
+    assert (not ($write_path | path exists)) "failed write should not create a file"
+
+    # The mount is intentionally not noexec.
+    let true_result = (do -i { ^($usr | path join "bin/true") } | complete)
+    assert equal $true_result.exit_code 0 "mounted /usr/bin/true should be executable"
+
+    # A target that holds content, or already a mount, is refused.
+    let err = (bootc_fails image mount --deployment booted --source /usr --target $usr)
+    assert ($err | str contains "must be empty") $err
+    let tmpfs = ($base | path join "tmpfs")
+    mkdir $tmpfs
+    mount -t tmpfs tmpfs $tmpfs
+    let err = (bootc_fails image mount --deployment booted --source /usr --target $tmpfs)
+    assert ($err | str contains "already a mountpoint") $err
+    umount $tmpfs
+
+    unmount_image $usr
+    unmount_image $root
+    let err = (bootc_fails image unmount $usr)
+    assert ($err | str contains "is not a mountpoint") $err
+
+    # /mnt is a symlink to var/mnt on bootc systems; the target path may use it.
+    let mnt_target = "/mnt/bootc-image-mount-test"
+    mkdir $mnt_target
+    mount_image booted /usr $mnt_target
+    assert ($mnt_target | path join "lib/os-release" | path exists)
+    unmount_image $mnt_target
+    rm $mnt_target
 }
 
-def verify_image_mounts [base] {
-    let root_target = ($base | path join "root")
-    let usr_target = ($base | path join "usr")
-    let staged_target = ($base | path join "staged")
-    mut mounted = []
-    let result = try {
-        mkdir $root_target $usr_target $staged_target
+def test_errors [base: string] {
+    let target = ($base | path join "errors")
+    mkdir $target
 
-        mount_image booted / $root_target
-        $mounted = ($mounted | append $root_target)
-        mount_image booted /usr $usr_target
-        $mounted = ($mounted | append $usr_target)
+    let err = (bootc_fails image mount --deployment booted --source /usr/nonexistent --target $target)
+    assert ($err | str contains "No such file") $err
+    let err = (bootc_fails image mount --deployment booted --source /usr/lib/os-release --target $target)
+    assert ($err | str contains "must both be directories") $err
+    let err = (bootc_fails image mount --deployment booted --source usr --target $target)
+    assert ($err | str contains "absolute") $err
+    let err = (bootc_fails image mount --deployment booted --source /usr --target ($base | path join "missing"))
+    assert ($err | str contains "No such file") $err
+    let err = (bootc_fails image mount --deployment staged --source /usr --target $target)
+    assert ($err | str contains "No staged") $err
 
-        let root_os_release = ($root_target | path join "usr/lib/os-release")
-        let usr_os_release = ($usr_target | path join "lib/os-release")
-        assert ($root_os_release | path exists) "booted root mount should contain usr/lib/os-release"
-        assert ($usr_os_release | path exists) "/usr mount should contain lib/os-release"
-        assert equal (open $root_os_release | into string) (open $usr_os_release | into string)
-
-        assert_mount_options $root_target
-        assert_mount_options $usr_target
-
-        let write_path = ($usr_target | path join ".bootc-image-mount-write-test")
-        let write_result = (do -i { touch $write_path } | complete)
-        assert ($write_result.exit_code != 0) "writes to mounted image content should fail"
-        assert (not ($write_path | path exists)) "failed write should not create a file"
-
-        # The mount is intentionally not noexec; verify an image executable runs.
-        let true_path = ($usr_target | path join "bin/true")
-        let executable_result = (do -i { ^$true_path } | complete)
-        assert equal $executable_result.exit_code 0 "mounted /usr/bin/true should be executable"
-
-        let status = (bootc status --json | from json)
-        if (($status.status.staged? | default null) != null) {
-            mount_image staged /usr $staged_target
-            $mounted = ($mounted | append $staged_target)
-            let staged_os_release = ($staged_target | path join "lib/os-release")
-            assert ($staged_os_release | path exists) "staged /usr mount should contain lib/os-release"
-            assert_mount_options $staged_target
-        } else {
-            print "SKIP: staged image-mount coverage unavailable (active backend reports no staged deployment)"
-        }
-        true
-    } catch { |error| $error }
-
-    {
-        result: $result
-        mounted: $mounted
-    }
+    "content" | save ($target | path join "existing")
+    let err = (bootc_fails image mount --deployment booted --source /usr --target $target)
+    assert ($err | str contains "must be empty") $err
+    assert (not (is_mountpoint $target)) "failed mounts should not leave a mount behind"
 }
 
-let base = (^mktemp -d /run/bootc-image-mount.XXXXXX | str trim)
-let test_outcome = (verify_image_mounts $base)
-let mount_cleanup_errors = (cleanup_targets $test_outcome.mounted)
-let cleanup_errors = if (($mount_cleanup_errors | length) > 0) {
-    $mount_cleanup_errors | append $"($base): directory retained because a mount could not be unmounted"
-} else {
-    let remove_result = (do -i { rm --recursive $base } | complete)
-    if $remove_result.exit_code == 0 {
-        []
+def stage_derived_image [] {
+    bootc image copy-to-storage
+    # Disable composefs for the staged ostree deployment so that it is a plain
+    # checkout; the prepare-root.conf of the deployment decides that.
+    let ostree_setup = if (tap is_composefs) {
+        ""
     } else {
-        [$"($base): failed to remove test directory: ($remove_result.stderr)"]
+        "RUN sed -i -e '/^\\[composefs\\]/,/^\\[/ s/^enabled *=.*/enabled = no/' /usr/lib/ostree/prepare-root.conf && grep -q '^enabled = no' /usr/lib/ostree/prepare-root.conf"
     }
+    # make_uki_containerfile appends stages that build on `base`.
+    let containerfile = $"FROM localhost/bootc as base
+RUN mkdir -p ($marker_dir) && echo staged > ($marker_dir)/marker
+($ostree_setup)
+"
+    (tap make_uki_containerfile $containerfile) | save --force Containerfile
+    podman build -t $staged_image .
+    bootc switch --transport containers-storage $staged_image
+    let status = (bootc status --json | from json)
+    assert ($status.status.staged? != null) "bootc switch should stage a deployment"
 }
 
-if (($cleanup_errors | length) > 0) {
-    error make {
-        msg: $"Failed to clean up image mounts: ($cleanup_errors); test result: ($test_outcome.result)"
+def test_staged [] {
+    # Mount below /var, which bootc must leave alone otherwise (bootc#2433).
+    let base = (^mktemp -d /var/tmp/bootc-image-mount.XXXXXX | str trim)
+    let staged_opt = ($base | path join "staged-opt")
+    let booted_opt = ($base | path join "booted-opt")
+    let staged_usr = ($base | path join "staged-usr")
+    mkdir $staged_opt $booted_opt $staged_usr
+
+    mount_image staged $marker_dir $staged_opt
+    assert_mount_options $staged_opt
+    assert equal (open ($staged_opt | path join "marker") | str trim) "staged"
+    # The documented copy-out use case.
+    let copy = ($base | path join "copy")
+    ^cp -a $"($staged_opt)/." $copy
+    assert equal (open ($copy | path join "marker") | str trim) "staged"
+
+    mount_image booted /opt $booted_opt
+    assert (not ($booted_opt | path join "bootc-image-mount-test" | path exists)) "booted /opt should not have the staged marker"
+
+    mount_image staged /usr $staged_usr
+    assert ($staged_usr | path join "lib/os-release" | path exists)
+
+    if not (tap is_composefs) {
+        # The staged checkout's /etc is deployment state, not image content.
+        let target = ($base | path join "staged-root")
+        mkdir $target
+        let err = (bootc_fails image mount --deployment staged --source / --target $target)
+        assert ($err | str contains "/etc") $err
+        let err = (bootc_fails image mount --deployment staged --source /etc --target $target)
+        assert ($err | str contains "/usr/etc") $err
     }
+
+    for target in [$staged_opt $booted_opt $staged_usr] {
+        unmount_image $target
+    }
+    rm -r $base
 }
-if $test_outcome.result != true {
-    error make { msg: $"Image mount assertions failed: ($test_outcome.result)" }
+
+def main [] {
+    tap begin "bootc image mount"
+
+    let base = (^mktemp -d /run/bootc-image-mount.XXXXXX | str trim)
+    test_booted $base
+    test_errors $base
+    rm -r $base
+
+    stage_derived_image
+    test_staged
+
+    tap ok
 }
