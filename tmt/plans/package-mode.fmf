@@ -123,14 +123,16 @@ prepare:
       - cd bootc/hack && BOOTC_PROVISION_PACKIT_SKIP_REINSTALL=1 ./provision-packit.sh
     when: package_source == artifacts
   # Both sources now provide localhost/bootc in the guest's rootful storage.
-  # Pull the LBI references needed to install the image.
+  # Pull the LBI references needed to install the image, as the image names
+  # them (some are pinned).
   - how: shell
     order: 99
     script: |
       podman --remote=false image exists localhost/bootc
-      podman --remote=false pull quay.io/curl/curl:latest
-      podman --remote=false pull quay.io/curl/curl-base:latest
-      podman --remote=false pull registry.access.redhat.com/ubi9/podman:latest
+      for ref in $(podman --remote=false run --rm localhost/bootc \
+          sh -c 'cat /usr/lib/bootc/bound-images.d/*' | sed -n 's/^Image=//p'); do
+        podman --remote=false pull --retry 5 "$ref"
+      done
       workdir=$(mktemp -d)
       trap 'rm -rf -- "$workdir"' EXIT
       cat > "$workdir/Containerfile" <<'EOF'
