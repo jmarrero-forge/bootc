@@ -315,6 +315,21 @@ pub struct BootEntryComposefs {
     pub boot_digest: Option<String>,
     /// Whether fs-verity validation is optional
     pub missing_verity_allowed: bool,
+    /// Changes made locally on top of the image (experimental; see
+    /// `bootc internals local-layer`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_layer: Option<LocalLayerStatus>,
+}
+
+/// A local layer: commands run against the base image, whose changes form
+/// one more layer on top of it
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalLayerStatus {
+    /// The commands, in order, each as its argument vector
+    pub commands: Vec<Vec<String>>,
+    /// The manifest digest of the image the layer was built on
+    pub base_image_digest: String,
 }
 
 /// A bootable entry
