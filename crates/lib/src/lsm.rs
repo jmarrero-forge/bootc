@@ -208,9 +208,15 @@ pub(crate) fn selinux_ensure_install_or_setenforce(
 
 /// A thin wrapper for loading a SELinux policy that maps "policy nonexistent" to None.
 pub(crate) fn new_sepolicy_at(fd: impl AsFd) -> Result<Option<ostree::SePolicy>> {
+    // Loading sets libselinux's process-wide policy root before opening the
+    // file contexts below it, so two loads at once could mix up policies.
+    static LOADING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let fd = fd.as_fd();
     let cancellable = gio::Cancellable::NONE;
-    let sepolicy = ostree::SePolicy::new_at(fd.as_raw_fd(), cancellable)?;
+    let sepolicy = {
+        let _loading = LOADING.lock().unwrap_or_else(|e| e.into_inner());
+        ostree::SePolicy::new_at(fd.as_raw_fd(), cancellable)?
+    };
     let r = if sepolicy.csum().is_none() {
         None
     } else {
@@ -366,23 +372,30 @@ pub(crate) fn has_security_selinux(root: &Dir, path: &Utf8Path) -> Result<SELinu
     has_security_selinux_inner(root, path, Some(&unlabeled_type))
 }
 
+/// Read the `security.selinux` extended attribute of the target path.
+/// Symbolic links are not followed for the target.
+fn read_security_selinux(root: &Dir, path: &Utf8Path) -> rustix::io::Result<Vec<u8>> {
+    // TODO: avoid hardcoding a max size here
+    let mut buf = [0u8; 2048];
+    let fdpath = format!("/proc/self/fd/{}/{path}", root.as_raw_fd());
+    let len = rustix::fs::lgetxattr(fdpath, "security.selinux", &mut buf)?;
+    Ok(buf[..len].to_vec())
+}
+
 fn has_security_selinux_inner(
     root: &Dir,
     path: &Utf8Path,
     unlabeled_type: Option<&UnlabeledType>,
 ) -> Result<SELinuxLabelState> {
-    // TODO: avoid hardcoding a max size here
-    let mut buf = [0u8; 2048];
-    let fdpath = format!("/proc/self/fd/{}/{path}", root.as_raw_fd());
-    match rustix::fs::lgetxattr(fdpath, "security.selinux", &mut buf) {
-        Ok(len) => {
+    match read_security_selinux(root, path) {
+        Ok(label) => {
             // Installation can relabel a target while its host has SELinux disabled.
             // In that case, retain the conservative xattr-presence behavior.
             let Some(unlabeled_type) = unlabeled_type else {
                 return Ok(SELinuxLabelState::Labeled);
             };
             let unlabeled = unlabeled_type
-                .matches(&buf[..len])
+                .matches(&label)
                 .with_context(|| format!("Parsing SELinux context for {path:?}"))?;
             if unlabeled {
                 Ok(SELinuxLabelState::Unlabeled)
@@ -421,7 +434,7 @@ fn ensure_labeled_inner(
 ) -> Result<SELinuxLabelState> {
     let r = has_security_selinux_inner(root, path, unlabeled_type)?;
     if matches!(r, SELinuxLabelState::Unlabeled) {
-        relabel(root, metadata, path, None, policy)?;
+        relabel_with(root, metadata, path, None, policy, unlabeled_type)?;
     }
     Ok(r)
 }
@@ -429,6 +442,10 @@ fn ensure_labeled_inner(
 /// Given the policy, relabel the target file or directory.
 /// Optionally, an override for the path can be provided
 /// to set the label as if the target has that filename.
+///
+/// A path that the policy labels `<<none>>` (such as `/var/tmp/.*`) has no
+/// label in it: like setfiles and restorecon, this leaves its label alone.
+/// If it has none, it gets its directory's, as a file created there would.
 pub(crate) fn relabel(
     root: &Dir,
     metadata: &Metadata,
@@ -436,29 +453,88 @@ pub(crate) fn relabel(
     as_path: Option<&Utf8Path>,
     policy: &ostree::SePolicy,
 ) -> Result<()> {
+    let unlabeled_type = UnlabeledType::query()?;
+    relabel_with(
+        root,
+        metadata,
+        path,
+        as_path,
+        policy,
+        unlabeled_type.as_ref(),
+    )
+}
+
+/// [`relabel`], with the `unlabeled_type` already looked up.
+fn relabel_with(
+    root: &Dir,
+    metadata: &Metadata,
+    path: &Utf8Path,
+    as_path: Option<&Utf8Path>,
+    policy: &ostree::SePolicy,
+    unlabeled_type: Option<&UnlabeledType>,
+) -> Result<()> {
     assert!(!path.starts_with("/"));
     let as_path = as_path
         .map(Cow::Borrowed)
         .unwrap_or_else(|| Utf8Path::new("/").join(path).into());
-    let label = require_label(policy, &as_path, metadata.mode())?;
+    let Some(label) = optional_label(policy, &as_path, metadata.mode())? else {
+        if policy.csum().is_none() {
+            tracing::debug!("No SELinux policy loaded; not labeling {path}");
+            return Ok(());
+        }
+        return inherit_label(root, path, &as_path, unlabeled_type);
+    };
     tracing::trace!("Setting label for {path} to {label}");
     set_security_selinux_path(root, &path, label.as_bytes())
 }
 
-pub(crate) fn relabel_recurse_inner(
+/// For [`relabel`]: give `path`, which the policy has no label for (as
+/// `as_path`), its parent directory's label if it has none of its own.
+fn inherit_label(
+    root: &Dir,
+    path: &Utf8Path,
+    as_path: &Utf8Path,
+    unlabeled_type: Option<&UnlabeledType>,
+) -> Result<()> {
+    let state = |p: &Utf8Path| has_security_selinux_inner(root, p, unlabeled_type);
+    if state(path)? != SELinuxLabelState::Unlabeled {
+        tracing::debug!("No label for {as_path} in the policy; keeping {path}'s");
+        return Ok(());
+    }
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let parent = if parent.as_str().is_empty() {
+        Utf8Path::new(".")
+    } else {
+        parent
+    };
+    if state(parent)? != SELinuxLabelState::Labeled {
+        tracing::debug!("No label for {as_path} in the policy, nor on {parent}");
+        return Ok(());
+    }
+    let label = read_security_selinux(root, parent)
+        .with_context(|| format!("Reading the SELinux label of {parent}"))?;
+    tracing::debug!("No label for {as_path} in the policy; giving {path} {parent}'s");
+    set_security_selinux_path(root, path, &label)
+}
+
+fn relabel_recurse_inner(
     root: &Dir,
     path: &mut Utf8PathBuf,
     mut as_path: Option<&mut Utf8PathBuf>,
     policy: &ostree::SePolicy,
+    unlabeled_type: Option<&UnlabeledType>,
 ) -> Result<()> {
     // Relabel this directory
     let self_meta = root.dir_metadata()?;
-    relabel(
+    relabel_with(
         root,
         &self_meta,
         path,
         as_path.as_ref().map(|p| p.as_path()),
         policy,
+        unlabeled_type,
     )?;
 
     // Relabel all children
@@ -477,10 +553,10 @@ pub(crate) fn relabel_recurse_inner(
 
         if metadata.is_dir() {
             let as_path = as_path.as_deref_mut();
-            relabel_recurse_inner(root, path, as_path, policy)?;
+            relabel_recurse_inner(root, path, as_path, policy, unlabeled_type)?;
         } else {
             let as_path = as_path.as_ref().map(|p| p.as_path());
-            relabel(root, &metadata, &path, as_path, policy)?
+            relabel_with(root, &metadata, &path, as_path, policy, unlabeled_type)?
         }
         // Trim what we added to the path
         let r = path.pop();
@@ -509,7 +585,14 @@ pub(crate) fn relabel_recurse(
     if let Some(as_path) = as_path.as_deref() {
         assert!(as_path.starts_with("/"));
     }
-    relabel_recurse_inner(root, &mut path, as_path.as_mut(), policy)
+    let unlabeled_type = UnlabeledType::query()?;
+    relabel_recurse_inner(
+        root,
+        &mut path,
+        as_path.as_mut(),
+        policy,
+        unlabeled_type.as_ref(),
+    )
 }
 
 /// Recursively ensure all files under a directory have SELinux labels.
@@ -705,6 +788,64 @@ mod tests {
     }
 
     #[test]
+    fn relabel_none() -> Result<()> {
+        use testutil::*;
+        const ROOT: &str = "system_u:object_r:root_t:s0";
+        const VAR: &str = "system_u:object_r:var_t:s0";
+        const TMP: &str = "system_u:object_r:tmp_t:s0";
+        const OTHER: &str = "system_u:object_r:user_tmp_t:s0";
+        let td = cap_std_ext::cap_tempfile::tempdir(cap_std::ambient_authority())?;
+        td.create_dir("policy")?;
+        let policy = file_contexts_policy(
+            &td.open_dir("policy")?,
+            &format!("/\t{ROOT}\n/var(/.*)?\t{VAR}\n/var/tmp\t-d\t{TMP}\n/var/tmp/.*\t<<none>>\n"),
+        )?;
+        td.create_dir_all("var/tmp/dir")?;
+        for f in ["labeled", "unlabeled", "dir/nested"] {
+            td.write(Utf8Path::new("var/tmp").join(f), "")?;
+        }
+        if let Some(why) = cannot_label(&td, "var/tmp/labeled", OTHER) {
+            eprintln!("skipping relabel_none: {why}");
+            return Ok(());
+        }
+        assert!(is_unlabeled(&td, "var/tmp/labeled")?);
+        set_security_selinux_path(&td, "var/tmp/labeled".into(), OTHER.as_bytes())?;
+        // Both the full relabel and the one of unlabeled files
+        for full in [true, false] {
+            for p in [
+                "var",
+                "var/tmp",
+                "var/tmp/unlabeled",
+                "var/tmp/dir",
+                "var/tmp/dir/nested",
+            ] {
+                unlabel(&td, p)?;
+            }
+            if full {
+                relabel_recurse(&td, "var", None, &policy)?;
+            } else {
+                ensure_dir_labeled_recurse(&td, &mut Utf8PathBuf::from("var"), &policy, None)?;
+            }
+            assert_eq!(label(&td, "var")?, VAR);
+            assert_eq!(label(&td, "var/tmp")?, TMP);
+            // <<none>>: a label is kept, and a file without one gets its
+            // directory's
+            assert_eq!(label(&td, "var/tmp/labeled")?, OTHER, "full: {full}");
+            for p in ["var/tmp/unlabeled", "var/tmp/dir", "var/tmp/dir/nested"] {
+                assert_eq!(label(&td, p)?, TMP, "{p}, full: {full}");
+            }
+        }
+        // Below a directory without a label, it stays without one
+        for p in ["var/tmp/dir", "var/tmp/dir/nested"] {
+            unlabel(&td, p)?;
+        }
+        let nested = Utf8Path::new("var/tmp/dir/nested");
+        relabel(&td, &td.symlink_metadata(nested)?, nested, None, &policy)?;
+        assert!(is_unlabeled(&td, nested.as_str())?);
+        Ok(())
+    }
+
+    #[test]
     #[cfg(feature = "selinux")]
     fn test_unlabeled_type() {
         // Only meaningful where SELinux is enabled
@@ -748,6 +889,90 @@ mod tests {
                     .as_deref(),
                 *expected_type
             );
+        }
+    }
+}
+
+/// Helpers for tests that label files with a policy of their own.
+#[cfg(test)]
+pub(crate) mod testutil {
+    use super::*;
+
+    const UNLABELED: &str = "system_u:object_r:unlabeled_t:s0";
+
+    /// Write a policy with only `file_contexts` below `root`, enough for
+    /// labeling lookups, and load it.
+    pub(crate) fn file_contexts_policy(
+        root: &Dir,
+        file_contexts: &str,
+    ) -> Result<ostree::SePolicy> {
+        root.create_dir_all("etc/selinux/test/contexts/files")?;
+        root.create_dir_all("etc/selinux/test/policy")?;
+        root.write(
+            "etc/selinux/config",
+            "SELINUX=enforcing\nSELINUXTYPE=test\n",
+        )?;
+        root.write(
+            "etc/selinux/test/contexts/files/file_contexts",
+            file_contexts,
+        )?;
+        root.write("etc/selinux/test/policy/policy.33", "")?;
+        new_sepolicy_at(root)?.context("Loading the test policy")
+    }
+
+    /// The label of `path`.
+    pub(crate) fn label(root: &Dir, path: &str) -> Result<String> {
+        let label = read_security_selinux(root, path.into())
+            .with_context(|| format!("Reading the SELinux label of {path}"))?;
+        let label = label.strip_suffix(b"\0").unwrap_or(&label);
+        Ok(String::from_utf8(label.to_vec())?)
+    }
+
+    /// Make `path` unlabeled as this process sees it: where it sees SELinux,
+    /// which doesn't let labels be removed, give it the unlabeled context;
+    /// elsewhere remove its label.
+    pub(crate) fn unlabel(root: &Dir, path: &str) -> Result<()> {
+        if selinux_enabled() {
+            return set_security_selinux_path(root, path.into(), UNLABELED.as_bytes());
+        }
+        let fdpath = format!("/proc/self/fd/{}/{path}", root.as_raw_fd());
+        match rustix::fs::lremovexattr(fdpath, "security.selinux") {
+            Ok(()) | Err(rustix::io::Errno::NODATA) => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("Removing the SELinux label of {path}")),
+        }
+    }
+
+    /// Whether `path` is unlabeled, as this process sees it.
+    pub(crate) fn is_unlabeled(root: &Dir, path: &str) -> Result<bool> {
+        let unlabeled_type = UnlabeledType::query()?;
+        let state = has_security_selinux_inner(root, path.into(), unlabeled_type.as_ref())?;
+        Ok(state == SELinuxLabelState::Unlabeled)
+    }
+
+    /// Why this process can't give `path` the `label` and then unlabel it,
+    /// if it can't: it isn't allowed to (a confined container), the kernel
+    /// doesn't know the label's type, or it hides SELinux from this process
+    /// (which then can't remove labels). This only checks the extended
+    /// attribute; tests check the classification with [`is_unlabeled`].
+    pub(crate) fn cannot_label(root: &Dir, path: &str, label: &str) -> Option<String> {
+        let probe = || -> Result<Option<String>> {
+            set_security_selinux_path(root, path.into(), label.as_bytes())?;
+            unlabel(root, path)?;
+            let read = match read_security_selinux(root, path.into()) {
+                Ok(l) => Some(l),
+                Err(rustix::io::Errno::NODATA) => None,
+                Err(e) => return Err(e.into()),
+            };
+            let read = read.as_deref().map(|l| l.strip_suffix(b"\0").unwrap_or(l));
+            let expected = selinux_enabled().then_some(UNLABELED.as_bytes());
+            Ok((read != expected).then(|| {
+                let read = read.map(String::from_utf8_lossy);
+                format!("{path} reads back {read:?} after unlabeling it")
+            }))
+        };
+        match probe() {
+            Ok(why) => why,
+            Err(e) => Some(format!("can't set and remove SELinux labels here: {e:#}")),
         }
     }
 }

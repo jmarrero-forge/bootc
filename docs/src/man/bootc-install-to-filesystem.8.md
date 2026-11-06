@@ -41,6 +41,75 @@ Switching or rolling back to an image whose initramfs predates this hides that
 `--replace=alongside`. Tools can tell whether a bootc binary supports it by
 looking for `defer-var` in the `Features:` list of `bootc --version`.
 
+To use separate filesystems for `/var` or its subdirectories, mount them beneath
+*ROOT_PATH* before invoking this command, and pass `--initialize-var-mounts`.
+On a fresh installation, bootc then initializes each empty mounted filesystem
+with its part of the image's `/var`, as it will be mounted at boot: content
+below a nested mount goes to the nested filesystem only. Without that option,
+such filesystems are left alone: the image's initial `/var` contents stay in
+the deployment's state directory, where these mounts hide them at boot.
+`--initialize-var-mounts` is an error over an existing ostree system or with
+`--replace=alongside`.
+
+Empty `lost+found` directories and directories needed to reach nested
+mountpoints do not prevent initialization. Mountpoints in or directly below a
+filesystem being initialized must resolve to directories in the image, not
+symlinks. A mount for which the image has no content is left empty.
+Filesystems that bootc initializes or leaves empty are synced, and SELinux
+labeled when SELinux is enabled. Paths the policy labels `<<none>>`, such as
+those below `/var/tmp`, keep the label they were copied with, or get their
+directory's if they have none: on ostree that is the label of the file in the
+deployment checkout, on composefs usually the directory's. Unlike the root filesystem, they are not
+remounted read-only. Symbolic links, ownership, permissions, and extended
+attributes are preserved. Hardlinks are kept within a filesystem where the
+image records them: a composefs image does, while an ostree commit stores
+identical files once and doesn't record hardlinks, so on ostree every file is
+copied on its own, as libostree does when it seeds `/var`. Hardlinks that would
+span filesystems become separate files.
+
+On a booted system, `bootc state initialize-var [PATH]` initializes the empty
+block-device filesystems mounted at or below *PATH* (by default `/var`) from
+the booted image's `/var` the same way, for example a volume added after
+installation. Other mounts there, such as tmpfs, network filesystems, bind
+mounts of a subdirectory, btrfs subvolumes or ZFS datasets, are left alone,
+and still count as the boundaries of the filesystems around them: an empty
+volume with a tmpfs mounted below it is initialized around the tmpfs. A bind
+mount of a whole block-device filesystem looks like that filesystem's own mount
+(its source is the device) and is treated the same.
+
+A mounted filesystem that already contains data is left alone, without merging
+image contents into it, and bootc says so. Empty filesystems above or below it
+are still initialized, without the content that belongs to it. If copying into
+a filesystem fails, the installation fails, and that filesystem may be left
+partly filled; if it is no longer empty, bootc will not initialize it again on
+its own. The filesystems initialized before the failure are still labeled and
+synced. A filesystem that is still empty, because the image has nothing for
+it, counts as not initialized: a later run copies the image's empty directory
+again, which resets the owner, mode and SELinux label of its root. Both are
+also logged to the journal when it is available, with
+`MESSAGE_ID=a3dbd7d2ce1341feb6f6003a98eb6657`. This does not change
+upgrade semantics: subsequent image updates do not update `/var`. The caller
+remains responsible for configuring `/etc/fstab` or mount units so the
+filesystems are mounted at the same locations on subsequent boots.
+
+Combined with `--defer-var` (see above), bootc instead copies the image's
+`/var` into `/var` as it will be at boot: the deferred state directory gets
+what is not on a mounted filesystem, and each empty mounted filesystem gets its
+part, so nothing is stored twice. With a filesystem mounted on `/var` itself,
+the state directory keeps only its marker.
+
+When a filesystem is mounted on `/var` itself, bootc also writes an empty
+`.bootc-var-mounts` file into the deployment's state directory for `/var`. On
+composefs it tells setup-root to leave `/var` to that filesystem's fstab entry
+instead of bind-mounting the state directory over it, as for `--defer-var`
+(see **bootc-setup-root-conf**(5)). An initramfs that predates this ignores the
+file: switching or rolling back to such an image bind-mounts the state
+directory, with the `/var` seeded at installation, over that filesystem.
+
+Tools can tell whether a bootc binary supports `--initialize-var-mounts` by
+looking for `initialize-var-mounts` in the `Features:` list of
+`bootc --version`.
+
 # OPTIONS
 
 <!-- BEGIN GENERATED OPTIONS -->
@@ -61,6 +130,10 @@ looking for `defer-var` in the `Features:` list of `bootc --version`.
 **--defer-var**
 
     Do not seed the deployment's state directory with the image's /var
+
+**--initialize-var-mounts**
+
+    Initialize empty filesystems mounted at or below /var in the target from the image's /var, including nested mounts
 
 **--replace**=*REPLACE*
 
