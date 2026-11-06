@@ -629,41 +629,47 @@ fn create_staged_placeholder(
     with_staging_dir(dst_parent, |_, staging| {
         create_mountpoint_placeholder(src_parent, staging, name)?;
         if !publish_staged_entry(staging, dst_parent, name, relative)? {
-            validate_empty_placeholder(dst_parent, name, src_parent.symlink_metadata(name)?)?;
+            validate_existing_placeholder(
+                dst_parent,
+                name,
+                relative,
+                src_parent.symlink_metadata(name)?,
+            )?;
         }
         Ok(())
     })
 }
 
-fn validate_empty_placeholder(
+/// The destination already has an entry where a nested mount's placeholder
+/// goes, typically because ostree seeded the new stateroot's `/var` from the
+/// image (e.g. `/var/log` in an image that ran dnf). Keep it: the mount covers
+/// it at boot. Only an entry of a different type can't serve as a mountpoint.
+fn validate_existing_placeholder(
     destination_parent: &CapStdDir,
     name: &OsStr,
+    relative: &Path,
     source_metadata: Metadata,
 ) -> Result<()> {
     let destination_metadata = destination_parent.symlink_metadata(name)?;
-    if source_metadata.is_dir() {
-        anyhow::ensure!(
-            destination_metadata.is_dir(),
-            "Mountpoint placeholder {} exists with the wrong type",
-            name.to_string_lossy()
-        );
-        let destination = open_child_dir_nofollow(destination_parent, name)?;
-        let mut entries = destination.read_dir(".")?;
-        anyhow::ensure!(
-            entries.next().transpose()?.is_none(),
-            "Mountpoint placeholder {} is not empty",
-            name.to_string_lossy()
-        );
+    let same_type = (source_metadata.is_dir() && destination_metadata.is_dir())
+        || (source_metadata.is_file() && destination_metadata.is_file());
+    anyhow::ensure!(
+        same_type,
+        "Mountpoint placeholder /var/{} already exists in the new deployment with a different type",
+        relative.display()
+    );
+    let has_content = if destination_metadata.is_dir() {
+        open_child_dir_nofollow(destination_parent, name)?
+            .entries()?
+            .next()
+            .is_some()
     } else {
-        anyhow::ensure!(
-            source_metadata.is_file() && destination_metadata.is_file(),
-            "Mountpoint placeholder {} exists with the wrong type",
-            name.to_string_lossy()
-        );
-        anyhow::ensure!(
-            destination_metadata.len() == 0,
-            "Mountpoint placeholder {} is not empty",
-            name.to_string_lossy()
+        destination_metadata.len() > 0
+    };
+    if has_content {
+        println!(
+            "    Keeping the image's content at mountpoint /var/{}; the mount hides it at boot",
+            relative.display()
         );
     }
     Ok(())
@@ -1523,7 +1529,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_mountpoint_placeholders_are_retry_safe_and_type_checked() -> Result<()> {
+    fn mountpoint_placeholders_reuse_seeded_destinations_and_check_type() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let src_path = temp.path().join("src");
         fs::create_dir_all(src_path.join("directory-mount"))?;
@@ -1554,25 +1560,20 @@ mod tests {
             assert_eq!(fs::read_dir(dst_path.join("directory-mount"))?.count(), 0);
             assert_eq!(fs::metadata(dst_path.join("file-mount"))?.len(), 0);
 
+            // ostree seeds the new /var from the image, so a mountpoint can
+            // already have content there. It is kept untouched, and the mount
+            // hides it at boot.
             fs::write(dst_path.join("directory-mount/sentinel"), b"keep")?;
-            let error = if reflink {
-                preserve_var_reflink_mounts(&src, &dst, &[], &mounts)
+            fs::write(dst_path.join("file-mount"), b"keep file")?;
+            if reflink {
+                preserve_var_reflink_mounts(&src, &dst, &[], &mounts)?;
             } else {
-                preserve_var_copy_mounts(&src, &dst, &[], &mounts)
-            };
-            assert!(error.is_err());
+                preserve_var_copy_mounts(&src, &dst, &[], &mounts)?;
+            }
             assert_eq!(
                 fs::read(dst_path.join("directory-mount/sentinel"))?,
                 b"keep"
             );
-            fs::remove_file(dst_path.join("directory-mount/sentinel"))?;
-            fs::write(dst_path.join("file-mount"), b"keep file")?;
-            let error = if reflink {
-                preserve_var_reflink_mounts(&src, &dst, &[], &mounts)
-            } else {
-                preserve_var_copy_mounts(&src, &dst, &[], &mounts)
-            };
-            assert!(error.is_err());
             assert_eq!(fs::read(dst_path.join("file-mount"))?, b"keep file");
 
             let wrong_type = temp.path().join(format!("wrong-type-{strategy}"));
