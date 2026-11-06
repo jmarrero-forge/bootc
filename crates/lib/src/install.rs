@@ -657,17 +657,13 @@ pub(crate) struct InstallToExistingRootOpts {
     /// (NIC profiles, SSH host keys, secrets, custom CA certificates, etc.)
     /// remain at `<root>/etc` but are not applied to the new deployment.
     ///
-    /// Passing this flag runs a 3-way merge using the `etc-merge` algorithm
-    /// after the core install completes:
+    /// With this flag, the host's `/etc` entries that differ from what its RPM
+    /// packages installed (edited package files, files no package owns, and
+    /// machine-specific `%ghost` files such as `machine-id`) are copied into
+    /// the new deployment's `/etc`. Entries that still match their package are
+    /// left to the image's version.
     ///
-    ///   A (pristine baseline) = `<deploy>/usr/etc`  — image's shipped defaults
-    ///   B (current live)      = `<root>/etc`        — running system's `/etc`
-    ///   C (new deployment)    = `<deploy>/etc`      — deploy target
-    ///
-    /// The diff A→B captures every file the admin changed relative to the image
-    /// defaults and applies those changes onto C.  This is the same algorithm
-    /// bootc uses during `bootc upgrade`, applied at install time rather than
-    /// only at upgrade time.
+    /// The host's RPM database is required.
     ///
     /// The running system's `root_path` must be mounted (e.g. `-v /:/target`).
     #[clap(long)]
@@ -2751,21 +2747,8 @@ pub(crate) async fn install_to_filesystem(
     // And the last bit of state here is the fsopts, which we also destructure now.
     let mut fsopts = opts.filesystem_opts;
 
-    // If we're doing an alongside install, automatically set up the host rootfs
-    // mount if it wasn't done already.
-    if targeting_host_root
-        && fsopts.root_path.as_str() == ALONGSIDE_ROOT_MOUNT
-        && !fsopts.root_path.try_exists()?
-    {
-        tracing::debug!("Mounting host / to {ALONGSIDE_ROOT_MOUNT}");
-        std::fs::create_dir(ALONGSIDE_ROOT_MOUNT)?;
-        bootc_mount::bind_mount_from_pidns(
-            bootc_mount::PID1,
-            "/".into(),
-            ALONGSIDE_ROOT_MOUNT.into(),
-            true,
-        )
-        .context("Mounting host / to {ALONGSIDE_ROOT_MOUNT}")?;
+    if targeting_host_root {
+        mount_alongside_root_if_needed(&fsopts.root_path)?;
     }
 
     let target_root_path = fsopts.root_path.clone();
@@ -3008,6 +2991,23 @@ pub(crate) async fn install_to_filesystem(
     Ok(deployment_path)
 }
 
+/// For an alongside install, set up the host rootfs mount at the default
+/// target path if it wasn't done already (e.g. with `-v /:/target`).
+fn mount_alongside_root_if_needed(root_path: &Utf8Path) -> Result<()> {
+    if root_path.as_str() == ALONGSIDE_ROOT_MOUNT && !root_path.try_exists()? {
+        tracing::debug!("Mounting host / to {ALONGSIDE_ROOT_MOUNT}");
+        std::fs::create_dir(ALONGSIDE_ROOT_MOUNT)?;
+        bootc_mount::bind_mount_from_pidns(
+            bootc_mount::PID1,
+            "/".into(),
+            ALONGSIDE_ROOT_MOUNT.into(),
+            true,
+        )
+        .context("Mounting host / to {ALONGSIDE_ROOT_MOUNT}")?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn install_to_existing_root(opts: InstallToExistingRootOpts) -> Result<()> {
     // Log the existing root installation operation to systemd journal
     const INSTALL_EXISTING_ROOT_JOURNAL_ID: &str = "7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1";
@@ -3053,6 +3053,15 @@ pub(crate) async fn install_to_existing_root(opts: InstallToExistingRootOpts) ->
         anyhow::bail!("--preserve-var and --merge-etc require the ostree backend");
     }
 
+    // Read the host's package defaults while its /boot is still intact: once
+    // the install starts, a failure leaves only the new deployment to boot.
+    let etc_merge = if merge_etc {
+        mount_alongside_root_if_needed(&opts.root_path)?;
+        Some(migrate::EtcMergePlan::prepare(&root_path)?)
+    } else {
+        None
+    };
+
     let fs_opts = InstallToFilesystemOpts {
         filesystem_opts: InstallTargetFilesystemOpts {
             root_path: opts.root_path,
@@ -3088,7 +3097,7 @@ pub(crate) async fn install_to_existing_root(opts: InstallToExistingRootOpts) ->
             .context("Post-install /var preservation")?;
     }
 
-    if merge_etc {
+    if let Some(etc_merge) = etc_merge {
         println!();
         println!("Merging running /etc into new deployment...");
         let deployment_path = deployment_path
@@ -3099,8 +3108,12 @@ pub(crate) async fn install_to_existing_root(opts: InstallToExistingRootOpts) ->
         } else {
             root_path.clone()
         };
-        migrate::merge_etc_into_deployment(&root_path, &physical_root.join(deployment_path))
-            .context("Post-install /etc merge")?;
+        migrate::merge_etc_into_deployment(
+            &etc_merge,
+            &root_path,
+            &physical_root.join(deployment_path),
+        )
+        .context("Post-install /etc merge")?;
     }
 
     Ok(())
