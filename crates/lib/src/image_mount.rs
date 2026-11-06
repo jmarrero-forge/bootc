@@ -216,8 +216,17 @@ fn staged_composefs_deployment_id(booted_id: &str) -> Result<String> {
 
     let staged_path =
         format!("{COMPOSEFS_TRANSIENT_STATE_DIR}/{COMPOSEFS_STAGED_DEPLOYMENT_FNAME}");
-    let staged_json = std::fs::read_to_string(&staged_path)
-        .with_context(|| format!("Reading staged composefs deployment selector {staged_path}"))?;
+    let staged_json = match std::fs::read_to_string(&staged_path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            bail!("No staged composefs deployment found")
+        }
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!("Reading staged composefs deployment selector {staged_path}")
+            });
+        }
+    };
     let id = staged_composefs_id_from_json(&staged_json, booted_id)?;
 
     let sysroot = Dir::open_ambient_dir("/sysroot", ambient_authority())
