@@ -22,7 +22,10 @@ when supported, and otherwise performs a full copy. Reflinks are created per
 file. Each new entry is staged and renamed into place atomically for namespace
 visibility, but the migration is not a tree-wide point-in-time snapshot or a
 global all-or-nothing transaction: it proceeds over time, and a later failure
-can leave a partial migration. The copy is not a consistent snapshot of live
+can leave a partial migration. The source `/var` and its nested mounts are
+checked before the install starts, but the copy itself runs after the old
+system's boot entries are gone, so a failure while copying leaves the new
+deployment, with a partial `/var`, as the only system to boot. The copy is not a consistent snapshot of live
 data; stop stateful services or use a consistent snapshot before copying live
 database data. There is no crash-durability guarantee: copied content and
 renames are not guaranteed to survive sudden power loss or a kernel failure.

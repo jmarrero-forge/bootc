@@ -83,32 +83,87 @@ use cap_std_ext::cmdext::{CapStdExtCommandExt, CmdFds};
 #[cfg(test)]
 use fn_error_context::context;
 
+/// Paths below `/var` which `--preserve-var` never copies.
+const ALWAYS_EXCLUDED: &[&str] = &["tmp", "cache", "log/journal", "lib/containers"];
+
+/// What `--preserve-var` will copy, resolved before the install touches the
+/// target so that a problem with the source `/var` fails while the host can
+/// still boot its old system.
+#[derive(Debug)]
+pub(crate) struct VarMigrationPlan {
+    /// Canonical path of the running system's `/var`.
+    src_var: PathBuf,
+    /// Mounts below `src_var`, relative to it, which get empty placeholders.
+    nested_mounts: BTreeSet<PathBuf>,
+    /// The built-in and requested exclusions, relative to `src_var`.
+    exclusions: Vec<String>,
+}
+
+impl VarMigrationPlan {
+    /// `src_var` is the running system's `/var` (at `<root_path>/var`) and
+    /// `exclusions` the validated `--preserve-var-skip` paths.
+    pub(crate) fn prepare(src_var: &Path, exclusions: &[String]) -> Result<Self> {
+        // Resolve symlink aliases and path components before comparing against
+        // the absolute, kernel-resolved mountpoints in mountinfo.
+        let canonical_src_var = std::fs::canonicalize(src_var)
+            .with_context(|| format!("Canonicalizing source /var {}", src_var.display()))?;
+        // Check the source can be opened and read now rather than after install.
+        CapStdDir::open_ambient_dir(&canonical_src_var, ambient_authority())
+            .and_then(|dir| dir.entries().map(drop))
+            .with_context(|| format!("Opening source {}", canonical_src_var.display()))?;
+        let nested_mounts = mountinfo::nested_mountpoints_for(&canonical_src_var)?;
+        let exclusions = ALWAYS_EXCLUDED
+            .iter()
+            .map(|path| path.to_string())
+            .chain(exclusions.iter().cloned())
+            .collect::<Vec<_>>();
+        // Only directories and regular files can get a placeholder.
+        for mount in &nested_mounts {
+            // The copy never reaches mounts below an exclusion or below
+            // another nested mount.
+            let unreached = exclusions
+                .iter()
+                .any(|excluded| mount.starts_with(excluded))
+                || nested_mounts
+                    .iter()
+                    .any(|other| other != mount && mount.starts_with(other));
+            if unreached {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(canonical_src_var.join(mount))
+                .with_context(|| format!("Inspecting mountpoint /var/{}", mount.display()))?;
+            anyhow::ensure!(
+                metadata.is_dir() || metadata.is_file(),
+                "/var/{} is a mountpoint that is neither a directory nor a file; \
+                 exclude it with --preserve-var-skip",
+                mount.display()
+            );
+        }
+        Ok(Self {
+            src_var: canonical_src_var,
+            nested_mounts,
+            exclusions,
+        })
+    }
+}
+
 /// Preserve the running `/var` into the new deployment's `var/` directory.
 ///
-/// `src_var` is the running system's `/var` (at `<root_path>/var`).
-/// `new_var` is the new deployment's empty `var/` directory.
-pub(crate) fn preserve_var(src_var: &Path, new_var: &Path, exclusions: &[String]) -> Result<()> {
-    // Resolve symlink aliases and path components before comparing against the
-    // absolute, kernel-resolved mountpoints in mountinfo.
-    let canonical_src_var = std::fs::canonicalize(src_var)
-        .with_context(|| format!("Canonicalizing source /var {}", src_var.display()))?;
-    let nested_mounts = mountinfo::nested_mountpoints_for(&canonical_src_var)?;
-    let src_var = CapStdDir::open_ambient_dir(&canonical_src_var, ambient_authority())
-        .with_context(|| format!("Opening source {}", canonical_src_var.display()))?;
+/// `new_var` is the new deployment's `var/` directory, which ostree may
+/// already have seeded from the image's `/var`.
+pub(crate) fn preserve_var(plan: &VarMigrationPlan, new_var: &Path) -> Result<()> {
+    let src_var = CapStdDir::open_ambient_dir(&plan.src_var, ambient_authority())
+        .with_context(|| format!("Opening source {}", plan.src_var.display()))?;
     let new_var = open_or_create_var_dir(new_var)?;
-
-    let mut effective_exclusions = ["tmp", "cache", "log/journal", "lib/containers"]
-        .into_iter()
-        .map(String::from)
-        .collect::<Vec<_>>();
-    effective_exclusions.extend(exclusions.iter().cloned());
+    let effective_exclusions = &plan.exclusions;
+    let nested_mounts = &plan.nested_mounts;
 
     let copy_result = if supports_reflink(&src_var, &new_var)? {
         println!("  Filesystem supports reflinks — using copy-on-write clone (Strategy C)");
-        preserve_var_reflink_mounts(&src_var, &new_var, &effective_exclusions, &nested_mounts)
+        preserve_var_reflink_mounts(&src_var, &new_var, effective_exclusions, nested_mounts)
     } else {
         println!("  Filesystem does not support reflinks — falling back to full copy (Strategy D)");
-        preserve_var_copy_mounts(&src_var, &new_var, &effective_exclusions, &nested_mounts)
+        preserve_var_copy_mounts(&src_var, &new_var, effective_exclusions, nested_mounts)
     };
     copy_result?;
 
@@ -1078,6 +1133,26 @@ mod tests {
         )
         .unwrap();
         CapStdDir::from_std_file(std::fs::File::from(fd))
+    }
+
+    #[test]
+    fn migration_plan_is_checked_before_install() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let src_var = temp.path().join("var");
+        fs::create_dir(&src_var)?;
+        let plan = VarMigrationPlan::prepare(&src_var, &["lib/pgsql".to_string()])?;
+        assert_eq!(plan.src_var, fs::canonicalize(&src_var)?);
+        assert_eq!(
+            plan.exclusions,
+            ["tmp", "cache", "log/journal", "lib/containers", "lib/pgsql"]
+        );
+
+        let error = VarMigrationPlan::prepare(&temp.path().join("missing"), &[]).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Canonicalizing source /var"),
+            "{error:#}"
+        );
+        Ok(())
     }
 
     #[test]
