@@ -328,6 +328,8 @@ case ${TMT_REBOOT_COUNT:-0} in
         test "$(<"$etc_dir/default.conf")" = admin-modified
         test "$(<"$etc_dir/admin-only.conf")" = admin-only
         test "$(<"$etc_dir/image-only.conf")" = image-only
+        # The host's account databases win the merge, but keep the image's user.
+        getent passwd bootc-tmt-image-user
         mountpoint -q "$bind_target"
         test "$(<"$bind_target/mounted-sentinel")" = mounted-only-data
         ;;

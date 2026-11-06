@@ -57,10 +57,16 @@
 //! | B — current live      | `<root_path>/etc` (running admin customisations)  |
 //! | C — new deployment    | `<deploy_dir>/etc` (deploy target, written by image) |
 //!
-//! The diff A→B captures everything the admin changed relative to the image
-//! defaults and applies those changes onto C.  Machine-specific files (SSH host
-//! keys, machine-id, NIC profiles) are included because they are precisely what
-//! needs to be transferred to make the migrated system functional.
+//! A package-mode host has no pristine `/etc` of its own, and the image's is
+//! only a stand-in: the diff A→B also holds every difference between the
+//! host's package versions and the image's. So host entries that still match
+//! the host's RPM database are dropped from the diff (see
+//! [`package_defaults`]), and the image's version of them wins. What remains
+//! is what the admin (or the machine) changed: edited package files, files no
+//! package owns, and `%ghost` files such as SSH host keys and `machine-id`.
+//!
+//! Everything that can fail in the merge is first tried on a scratch copy of
+//! the image's `/etc` before the install starts (see [`EtcMergePlan`]).
 //!
 //! Rollback preservation is intentionally independent from `/var` migration.
 
@@ -79,33 +85,105 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use bootc_utils::CommandRunExt;
 use cap_std_ext::cap_std::ambient_authority;
 use cap_std_ext::cap_std::fs::{Dir as CapStdDir, Metadata, MetadataExt};
 use cap_std_ext::cap_std::io_lifetimes::AsFilelike;
 use cap_std_ext::cmdext::{CapStdExtCommandExt, CmdFds};
 use composefs_ctl::composefs::generic_tree::{FileSystem, Stat};
-use etc_merge::{compute_diff_without_deletions, merge, traverse_etc};
+use etc_merge::{Diff, compute_diff_without_deletions, merge, traverse_etc};
 use fn_error_context::context;
 
 use crate::store::reflink::supports_reflink;
 
+mod accounts;
+mod package_defaults;
+use package_defaults::PackageDefaults;
+
 // ── Top-level entry points ────────────────────────────────────────────────────
+
+/// What `--merge-etc` needs from the host, gathered before the install touches
+/// it, so that a failure leaves the host able to boot its old system.
+#[derive(Debug)]
+pub(crate) struct EtcMergePlan {
+    package_defaults: PackageDefaults,
+}
+
+impl EtcMergePlan {
+    /// Read which host `/etc` entries are unchanged package defaults, and
+    /// dry-run the merge into a scratch copy of `image_root`'s `/etc`, to
+    /// catch conflicts early. `image_root` is the image being installed when
+    /// it is the installer container's own (`/`); with `--source-imgref` it
+    /// is `None`, and conflicts are only found by the real merge.
+    ///
+    /// `root_path` is the host root as seen from inside the install container.
+    pub(crate) fn prepare(root_path: &Path, image_root: Option<&Path>) -> Result<Self> {
+        let package_defaults = PackageDefaults::from_rpmdb(root_path)?;
+        let Some(image_root) = image_root else {
+            println!(
+                "  Not checking for conflicts: the image to install isn't the installer's own"
+            );
+            return Ok(Self { package_defaults });
+        };
+        let image_etc = image_root.join("etc");
+        // The scratch copy goes on the host's filesystem rather than the
+        // container's, which may not take the host files' SELinux labels.
+        let scratch_parent = [root_path.join("var/tmp"), root_path.to_owned()]
+            .into_iter()
+            .find(|path| path.is_dir())
+            .context("Finding a scratch directory on the host")?;
+        let scratch = tempfile::Builder::new()
+            .prefix(".bootc-merge-etc-check.")
+            .tempdir_in(&scratch_parent)
+            .with_context(|| {
+                format!("Creating scratch directory in {}", scratch_parent.display())
+            })?;
+        let scratch_etc = scratch.path().join("etc");
+        Command::new("cp")
+            .args(["-a", "--reflink=auto", "--"])
+            .arg(&image_etc)
+            .arg(&scratch_etc)
+            .run_capture_stderr()
+            .context("Copying the image's /etc for a dry run of the merge")?;
+        merge_etc(
+            &package_defaults,
+            &root_path.join("etc"),
+            &image_etc,
+            &scratch_etc,
+            Some(&image_root.join("usr/lib")),
+            false,
+        )
+        .context("Checking the host's /etc merges into the image's; nothing was changed yet")?;
+        Ok(Self { package_defaults })
+    }
+}
 
 /// Run the 3-way `/etc` merge on the new deployment.
 ///
 /// Inputs:
 ///   - **A (pristine)** = `<deploy_dir>/usr/etc`
-///   - **B (current)**  = `<root_path>/etc`
+///   - **B (current)**  = `<root_path>/etc`, minus unchanged package defaults
 ///   - **C (new)**      = `<deploy_dir>/etc`
 ///
 /// `root_path` is the host root as seen from inside the install container.
 #[context("Running 3-way /etc merge into new deployment")]
-pub(crate) fn merge_etc_into_deployment(root_path: &Path, deploy_dir: &Path) -> Result<()> {
+pub(crate) fn merge_etc_into_deployment(
+    plan: &EtcMergePlan,
+    root_path: &Path,
+    deploy_dir: &Path,
+) -> Result<()> {
     let deploy_usr_etc = deploy_dir.join("usr/etc");
     let deploy_etc = deploy_dir.join("etc");
     let host_etc = root_path.join("etc");
 
-    merge_etc(&host_etc, &deploy_usr_etc, &deploy_etc)
+    merge_etc(
+        &plan.package_defaults,
+        &host_etc,
+        &deploy_usr_etc,
+        &deploy_etc,
+        Some(&deploy_dir.join("usr/lib")),
+        true,
+    )
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -1240,8 +1318,19 @@ pub(crate) fn validate_exclusions(exclusions: &[String]) -> Result<Vec<String>> 
 /// - `host_etc`       = `<root_path>/etc`      (running system, input B)
 /// - `deploy_usr_etc` = `<deploy_dir>/usr/etc` (image defaults, input A)
 /// - `deploy_etc`     = `<deploy_dir>/etc`     (new deploy target, input C)
+///
+/// Host entries in `package_defaults` are left out, so the image's version of
+/// them wins; their parent directories are kept when something below them is
+/// merged.
 #[context("Merging running /etc into new deployment")]
-fn merge_etc(host_etc: &Path, deploy_usr_etc: &Path, deploy_etc: &Path) -> Result<()> {
+fn merge_etc(
+    package_defaults: &PackageDefaults,
+    host_etc: &Path,
+    deploy_usr_etc: &Path,
+    deploy_etc: &Path,
+    image_usr_lib: Option<&Path>,
+    verbose: bool,
+) -> Result<()> {
     let pristine_fd = CapStdDir::open_ambient_dir(deploy_usr_etc, ambient_authority())
         .with_context(|| format!("Opening pristine etc: {}", deploy_usr_etc.display()))?;
     let current_fd = CapStdDir::open_ambient_dir(host_etc, ambient_authority())
@@ -1255,17 +1344,124 @@ fn merge_etc(host_etc: &Path, deploy_usr_etc: &Path, deploy_etc: &Path) -> Resul
 
     let new_tree = new_tree_opt.unwrap_or_else(|| FileSystem::new(Stat::uninitialized()));
 
-    let diff = compute_diff_without_deletions(&pristine_tree, &current_tree, &new_tree)
+    let mut diff = compute_diff_without_deletions(&pristine_tree, &current_tree, &new_tree)
         .context("Computing /etc diff")?;
+    retain_customisations(&mut diff, package_defaults, &new_fd);
 
-    println!("  /etc diff (changes being applied from running system):");
-    etc_merge::print_diff(&diff, &mut std::io::stdout());
+    if !diff.unmergable_paths.is_empty() {
+        etc_merge::print_unmergable_paths(&diff, &mut std::io::stderr());
+        anyhow::bail!(
+            "{} host /etc path(s) conflict with the image's /etc; resolve them on the host and retry",
+            diff.unmergable_paths.len()
+        );
+    }
+
+    if verbose {
+        println!("  /etc diff (changes being applied from running system):");
+        etc_merge::print_diff(&diff, &mut std::io::stdout());
+    }
+
+    // The merged selinux/config is the host's if it is carried.
+    let selinux_config_from = if diff
+        .changed_paths()
+        .any(|path| path == Path::new("selinux/config"))
+    {
+        &current_fd
+    } else {
+        &new_fd
+    };
+    check_selinux_policy_type(selinux_config_from, &new_fd)?;
 
     merge(&current_fd, &current_tree, &new_fd, &new_tree, &diff)
         .context("Applying /etc 3-way merge")?;
+    let image_lib = image_usr_lib
+        .map(|path| CapStdDir::open_ambient_dir(path, ambient_authority()))
+        .transpose()
+        .context("Opening the image's /usr/lib")?;
+    accounts::add_image_accounts(&pristine_fd, image_lib.as_ref(), &new_fd, verbose)
+        .context("Adding the image's accounts")?;
 
-    println!("  /etc merge complete.");
+    if verbose {
+        println!("  /etc merge complete.");
+    }
     Ok(())
+}
+
+/// Drop unchanged package defaults from `diff`. A default directory that an
+/// entry still merged below it needs is kept only if `new_etc` lacks it:
+/// merging it would also apply the host's mode, owner and label to it.
+fn retain_customisations(diff: &mut Diff, package_defaults: &PackageDefaults, new_etc: &CapStdDir) {
+    use cap_std_ext::dirext::CapStdExtDirExt;
+
+    // Generated content is left to the image, except files no package owns
+    // and package files the admin edited (e.g. selinux/<type>/setrans.conf).
+    let left_to_image = |path: &Path| {
+        package_defaults.contains(path)
+            || (generated_from_image_content(path)
+                && package_defaults.is_owned(path)
+                && !package_defaults.is_edited(path))
+    };
+    let needed_parents = diff
+        .changed_paths()
+        .filter(|path| !left_to_image(path))
+        .flat_map(|path| path.ancestors().skip(1))
+        .filter(|path| {
+            !new_etc
+                .symlink_metadata_optional(path)
+                .ok()
+                .flatten()
+                .is_some_and(|metadata| metadata.is_dir())
+        })
+        .map(Path::to_path_buf)
+        .collect::<BTreeSet<_>>();
+    diff.retain_changes(|path| !left_to_image(path) || needed_parents.contains(path));
+}
+
+/// The merged `selinux/config` (read from `config_etc`) may name a policy
+/// type from the host; since the policy store is the image's, that type must
+/// exist in `image_etc`.
+fn check_selinux_policy_type(config_etc: &CapStdDir, image_etc: &CapStdDir) -> Result<()> {
+    use cap_std_ext::dirext::CapStdExtDirExt;
+
+    let Some(config) = config_etc.read_to_string_optional("selinux/config")? else {
+        return Ok(());
+    };
+    let policy_type = config.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("SELINUXTYPE=")
+            .map(|value| value.trim().trim_matches('"'))
+    });
+    if let Some(policy_type) = policy_type {
+        let store = Path::new("selinux").join(policy_type);
+        anyhow::ensure!(
+            image_etc
+                .symlink_metadata_optional(&store)?
+                .is_some_and(|metadata| metadata.is_dir()),
+            "The host's /etc/selinux/config selects the {policy_type} SELinux policy, which the image doesn't have"
+        );
+    }
+    Ok(())
+}
+
+/// Host `/etc` content generated from what is installed, which the image's
+/// own copy replaces: caches, and the compiled SELinux policy store, which
+/// must match the image's policy. Only the SELinux settings an admin edits
+/// directly are kept. These are `%ghost` or unverified in the RPM database,
+/// so it can't tell them apart from admin state.
+fn generated_from_image_content(path: &Path) -> bool {
+    const GENERATED: &[&str] = &["ld.so.cache", "udev/hwdb.bin"];
+    const SELINUX_ADMIN: &[&str] = &["selinux/config", "selinux/semanage.conf"];
+    const SELINUX_LOCAL_SUFFIX: &str = "contexts/files/file_contexts.local";
+    if GENERATED
+        .iter()
+        .any(|generated| path == Path::new(generated))
+    {
+        return true;
+    }
+    path.starts_with("selinux")
+        && path != Path::new("selinux")
+        && !SELINUX_ADMIN.iter().any(|admin| path == Path::new(admin))
+        && !path.ends_with(SELINUX_LOCAL_SUFFIX)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1299,6 +1495,182 @@ mod tests {
         )
         .unwrap();
         CapStdDir::from_std_file(std::fs::File::from(fd))
+    }
+
+    #[test]
+    fn merge_etc_carries_customisations_and_leaves_package_defaults_to_the_image() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let [image, host, new] = ["image", "host", "new"].map(|name| temp.path().join(name));
+        for (root, files) in [
+            (
+                &image,
+                &[
+                    ("pam.d/login", "image pam"),
+                    ("ssh/sshd_config", "image sshd"),
+                    (
+                        "passwd",
+                        "root:x:0:0::/root:/bin/bash\nimguser:x:950:950::/:/sbin/nologin\n",
+                    ),
+                ][..],
+            ),
+            (
+                &host,
+                &[
+                    // An older package version's default: the image wins.
+                    ("pam.d/login", "old package pam"),
+                    // Edited by the admin: the host wins.
+                    ("ssh/sshd_config", "admin sshd"),
+                    (
+                        "passwd",
+                        "root:x:0:0::/root:/bin/bash\nbob:x:1000:1000::/home/bob:/bin/bash\n",
+                    ),
+                    // A package default directory with an admin file in it.
+                    ("hostpkg.d/default.conf", "host package default"),
+                    ("hostpkg.d/local.conf", "admin file"),
+                    // An admin file in a default directory the image has too.
+                    ("pam.d/local-admin", "admin file"),
+                    // A package the image doesn't have: dropped.
+                    ("oldpkg/oldpkg.conf", "host package default"),
+                ][..],
+            ),
+        ] {
+            for (path, content) in files {
+                let path = root.join(path);
+                fs::create_dir_all(path.parent().unwrap())?;
+                fs::write(path, content)?;
+            }
+        }
+        fs::set_permissions(image.join("pam.d"), fs::Permissions::from_mode(0o700))?;
+        fs::create_dir(&new)?;
+        Command::new("cp")
+            .args(["-a", "--"])
+            .arg(image.join("."))
+            .arg(&new)
+            .run_capture_stderr()?;
+
+        let defaults = PackageDefaults::from_paths(
+            [
+                "pam.d",
+                "pam.d/login",
+                "ssh",
+                "hostpkg.d",
+                "hostpkg.d/default.conf",
+                "oldpkg",
+                "oldpkg/oldpkg.conf",
+            ]
+            .map(PathBuf::from),
+        );
+        merge_etc(&defaults, &host, &image, &new, None, false)?;
+
+        let read = |path: &str| fs::read_to_string(new.join(path));
+        assert_eq!(read("pam.d/login")?, "image pam");
+        assert_eq!(read("ssh/sshd_config")?, "admin sshd");
+        assert_eq!(read("hostpkg.d/local.conf")?, "admin file");
+        // The image's directory keeps its own mode.
+        assert_eq!(read("pam.d/local-admin")?, "admin file");
+        assert_eq!(fs::metadata(new.join("pam.d"))?.mode() & 0o7777, 0o700);
+        assert!(!new.join("hostpkg.d/default.conf").exists());
+        assert!(!new.join("oldpkg").exists());
+        assert_eq!(
+            read("passwd")?,
+            "root:x:0:0::/root:/bin/bash\nbob:x:1000:1000::/home/bob:/bin/bash\n\
+             imguser:x:950:950::/:/sbin/nologin\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn merge_etc_refuses_a_policy_type_the_image_lacks() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let [image, host, new] = ["image", "host", "new"].map(|name| temp.path().join(name));
+        for root in [&image, &new] {
+            fs::create_dir_all(root.join("selinux/targeted"))?;
+            fs::write(
+                root.join("selinux/config"),
+                "SELINUX=enforcing\nSELINUXTYPE=targeted\n",
+            )?;
+        }
+        fs::create_dir_all(host.join("selinux"))?;
+        fs::write(
+            host.join("selinux/config"),
+            "SELINUX=enforcing\nSELINUXTYPE=mls\n",
+        )?;
+        let error = merge_etc(
+            &PackageDefaults::default(),
+            &host,
+            &image,
+            &new,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("mls SELinux policy"),
+            "{error:#}"
+        );
+        // Refused before anything was merged.
+        assert_eq!(
+            fs::read_to_string(new.join("selinux/config"))?,
+            "SELINUX=enforcing\nSELINUXTYPE=targeted\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn generated_content_is_left_to_the_image() -> Result<()> {
+        for (path, generated) in [
+            ("ld.so.cache", true),
+            ("udev/hwdb.bin", true),
+            ("udev/rules.d/90-local.rules", false),
+            ("selinux", false),
+            ("selinux/config", false),
+            ("selinux/semanage.conf", false),
+            ("selinux/targeted/policy/policy.35", true),
+            ("selinux/targeted/contexts/files/file_contexts.bin", true),
+            ("selinux/targeted/contexts/files/file_contexts.local", false),
+            ("selinuxish.conf", false),
+        ] {
+            assert_eq!(
+                generated_from_image_content(Path::new(path)),
+                generated,
+                "{path}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn merge_etc_fails_on_conflicts_before_changing_anything() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let [image, host, new] = ["image", "host", "new"].map(|name| temp.path().join(name));
+        fs::create_dir_all(image.join("ssl/certs"))?;
+        fs::create_dir_all(new.join("ssl/certs"))?;
+        fs::create_dir_all(host.join("ssl"))?;
+        fs::write(host.join("admin.conf"), "admin")?;
+        symlink("/etc/pki/tls/certs", host.join("ssl/certs"))?;
+
+        // An admin-made symlink where the image has a directory conflicts.
+        let error = merge_etc(
+            &PackageDefaults::default(),
+            &host,
+            &image,
+            &new,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("conflict with the image's /etc"),
+            "{error:#}"
+        );
+        assert!(!new.join("admin.conf").exists());
+
+        // The same symlink as a package default is not a conflict.
+        let defaults = PackageDefaults::from_paths([PathBuf::from("ssl/certs")]);
+        merge_etc(&defaults, &host, &image, &new, None, false)?;
+        assert!(new.join("ssl/certs").is_dir());
+        assert_eq!(fs::read_to_string(new.join("admin.conf"))?, "admin");
+        Ok(())
     }
 
     #[test]

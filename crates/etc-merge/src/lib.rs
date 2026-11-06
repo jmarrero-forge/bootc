@@ -98,6 +98,26 @@ pub struct Diff {
     pub unmergable_paths: Vec<UnmergablePaths>,
 }
 
+impl Diff {
+    /// Paths added to or modified in the current `/etc`, relative to it.
+    pub fn changed_paths(&self) -> impl Iterator<Item = &Path> {
+        self.added
+            .iter()
+            .chain(&self.modified)
+            .map(PathBuf::as_path)
+    }
+
+    /// Keep only the added, modified and unmergable paths for which `keep`
+    /// returns true, so that a caller with more knowledge of which changes are
+    /// intentional than a plain 3-way comparison can drop the others. Removed
+    /// paths are unaffected.
+    pub fn retain_changes(&mut self, mut keep: impl FnMut(&Path) -> bool) {
+        self.added.retain(|path| keep(path));
+        self.modified.retain(|path| keep(path));
+        self.unmergable_paths.retain(|path| keep(&path.path));
+    }
+}
+
 fn collect_all_files(
     root: &Directory<CustomMetadata>,
     current_path: PathBuf,
@@ -1105,6 +1125,38 @@ mod tests {
         merge(&current, &current_tree, &new, &new_tree, &diff)?;
 
         assert_eq!(new.read("image-only.conf")?, b"image default");
+        Ok(())
+    }
+
+    #[test]
+    fn retain_changes_filters_added_modified_and_unmergable() -> anyhow::Result<()> {
+        let tempdir = cap_std_ext::cap_tempfile::tempdir(cap_std::ambient_authority())?;
+        for dir in ["pristine_etc", "current_etc", "new_etc"] {
+            tempdir.create_dir(dir)?;
+        }
+        let pristine = tempdir.open_dir("pristine_etc")?;
+        let current = tempdir.open_dir("current_etc")?;
+        let new = tempdir.open_dir("new_etc")?;
+
+        pristine.write("kept.conf", b"default")?;
+        current.write("kept.conf", b"edited")?;
+        pristine.write("dropped.conf", b"default")?;
+        current.write("dropped.conf", b"other version")?;
+        current.write("added.conf", b"new")?;
+        // A host file where the new /etc has a directory is unmergable.
+        current.write("conflict", b"file")?;
+        new.create_dir("conflict")?;
+
+        let (pristine_tree, current_tree, new_tree) =
+            traverse_etc(&pristine, &current, Some(&new))?;
+        let mut diff =
+            compute_diff_without_deletions(&pristine_tree, &current_tree, &new_tree.unwrap())?;
+        assert_eq!(diff.unmergable_paths.len(), 1);
+
+        diff.retain_changes(|path| !["dropped.conf", "conflict"].contains(&path.to_str().unwrap()));
+        let changed = diff.changed_paths().collect::<Vec<_>>();
+        assert_eq!(changed, [Path::new("added.conf"), Path::new("kept.conf")]);
+        assert!(diff.unmergable_paths.is_empty());
         Ok(())
     }
 
