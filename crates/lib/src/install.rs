@@ -663,7 +663,9 @@ pub(crate) struct InstallToExistingRootOpts {
     /// the new deployment's `/etc`. Entries that still match their package are
     /// left to the image's version.
     ///
-    /// The host's RPM database is required.
+    /// The host's RPM database is required. Conflicts (for example a host
+    /// file where the image has a directory) are reported before the
+    /// install starts, and nothing is changed.
     ///
     /// The running system's `root_path` must be mounted (e.g. `-v /:/target`).
     #[clap(long)]
@@ -3053,11 +3055,19 @@ pub(crate) async fn install_to_existing_root(opts: InstallToExistingRootOpts) ->
         anyhow::bail!("--preserve-var and --merge-etc require the ostree backend");
     }
 
-    // Read the host's package defaults while its /boot is still intact: once
+    // Check that the host's /etc merges while its /boot is still intact: once
     // the install starts, a failure leaves only the new deployment to boot.
     let etc_merge = if merge_etc {
         mount_alongside_root_if_needed(&opts.root_path)?;
-        Some(migrate::EtcMergePlan::prepare(&root_path)?)
+        println!("Checking the host's /etc can be merged...");
+        // The installer container's own root is the image being installed,
+        // unless another one was named.
+        let image_root = opts
+            .source_opts
+            .source_imgref
+            .is_none()
+            .then(|| std::path::Path::new("/"));
+        Some(migrate::EtcMergePlan::prepare(&root_path, image_root)?)
     } else {
         None
     };

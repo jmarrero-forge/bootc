@@ -65,6 +65,9 @@
 //! is what the admin (or the machine) changed: edited package files, files no
 //! package owns, and `%ghost` files such as SSH host keys and `machine-id`.
 //!
+//! Everything that can fail in the merge is first tried on a scratch copy of
+//! the image's `/etc` before the install starts (see [`EtcMergePlan`]).
+//!
 //! Rollback preservation is intentionally independent from `/var` migration.
 
 use std::path::{Component, Path};
@@ -82,6 +85,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use bootc_utils::CommandRunExt;
 use cap_std_ext::cap_std::ambient_authority;
 use cap_std_ext::cap_std::fs::{Dir as CapStdDir, Metadata, MetadataExt};
 use cap_std_ext::cap_std::io_lifetimes::AsFilelike;
@@ -105,11 +109,49 @@ pub(crate) struct EtcMergePlan {
 }
 
 impl EtcMergePlan {
-    /// Read which host `/etc` entries are unchanged package defaults.
+    /// Read which host `/etc` entries are unchanged package defaults, and
+    /// dry-run the merge into a scratch copy of `image_root`'s `/etc`, to
+    /// catch conflicts early. `image_root` is the image being installed when
+    /// it is the installer container's own (`/`); with `--source-imgref` it
+    /// is `None`, and conflicts are only found by the real merge.
     ///
     /// `root_path` is the host root as seen from inside the install container.
-    pub(crate) fn prepare(root_path: &Path) -> Result<Self> {
+    pub(crate) fn prepare(root_path: &Path, image_root: Option<&Path>) -> Result<Self> {
         let package_defaults = PackageDefaults::from_rpmdb(root_path)?;
+        let Some(image_root) = image_root else {
+            println!(
+                "  Not checking for conflicts: the image to install isn't the installer's own"
+            );
+            return Ok(Self { package_defaults });
+        };
+        let image_etc = image_root.join("etc");
+        // The scratch copy goes on the host's filesystem rather than the
+        // container's, which may not take the host files' SELinux labels.
+        let scratch_parent = [root_path.join("var/tmp"), root_path.to_owned()]
+            .into_iter()
+            .find(|path| path.is_dir())
+            .context("Finding a scratch directory on the host")?;
+        let scratch = tempfile::Builder::new()
+            .prefix(".bootc-merge-etc-check.")
+            .tempdir_in(&scratch_parent)
+            .with_context(|| {
+                format!("Creating scratch directory in {}", scratch_parent.display())
+            })?;
+        let scratch_etc = scratch.path().join("etc");
+        Command::new("cp")
+            .args(["-a", "--reflink=auto", "--"])
+            .arg(&image_etc)
+            .arg(&scratch_etc)
+            .run_capture_stderr()
+            .context("Copying the image's /etc for a dry run of the merge")?;
+        merge_etc(
+            &package_defaults,
+            &root_path.join("etc"),
+            &image_etc,
+            &scratch_etc,
+            false,
+        )
+        .context("Checking the host's /etc merges into the image's; nothing was changed yet")?;
         Ok(Self { package_defaults })
     }
 }
@@ -1302,6 +1344,14 @@ fn merge_etc(
         .context("Computing /etc diff")?;
     retain_customisations(&mut diff, package_defaults, &new_fd);
 
+    if !diff.unmergable_paths.is_empty() {
+        etc_merge::print_unmergable_paths(&diff, &mut std::io::stderr());
+        anyhow::bail!(
+            "{} host /etc path(s) conflict with the image's /etc; resolve them on the host and retry",
+            diff.unmergable_paths.len()
+        );
+    }
+
     if verbose {
         println!("  /etc diff (changes being applied from running system):");
         etc_merge::print_diff(&diff, &mut std::io::stdout());
@@ -1409,7 +1459,6 @@ fn generated_from_image_content(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bootc_utils::CommandRunExt;
     use cap_std_ext::dirext::CapStdExtDirExt;
     use std::{
         fs,
@@ -1556,6 +1605,32 @@ mod tests {
                 "{path}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn merge_etc_fails_on_conflicts_before_changing_anything() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let [image, host, new] = ["image", "host", "new"].map(|name| temp.path().join(name));
+        fs::create_dir_all(image.join("ssl/certs"))?;
+        fs::create_dir_all(new.join("ssl/certs"))?;
+        fs::create_dir_all(host.join("ssl"))?;
+        fs::write(host.join("admin.conf"), "admin")?;
+        symlink("/etc/pki/tls/certs", host.join("ssl/certs"))?;
+
+        // An admin-made symlink where the image has a directory conflicts.
+        let error = merge_etc(&PackageDefaults::default(), &host, &image, &new, false).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("conflict with the image's /etc"),
+            "{error:#}"
+        );
+        assert!(!new.join("admin.conf").exists());
+
+        // The same symlink as a package default is not a conflict.
+        let defaults = PackageDefaults::from_paths([PathBuf::from("ssl/certs")]);
+        merge_etc(&defaults, &host, &image, &new, false)?;
+        assert!(new.join("ssl/certs").is_dir());
+        assert_eq!(fs::read_to_string(new.join("admin.conf"))?, "admin");
         Ok(())
     }
 
