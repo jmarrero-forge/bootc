@@ -20,6 +20,8 @@
 # <verify apply-live refuses>
 # bootc upgrade to an image that removes the bound .container
 # <verify apply-live stops the unit>
+# bootc upgrade to an image with the booted definition again
+# <verify apply-live starts the unit again>
 
 use std assert
 use tap.nu
@@ -211,6 +213,16 @@ def third_boot [] {
     assert not equal $r.exit_code 0
     let out = bootc apply-live bound-images
     assert ($out | str contains "already applied")
+
+    # Staging the booted definition again starts the unit the removal stopped
+    print "bootc upgrade restoring the bound container"
+    derive_image "LABEL apply-live-restore=1"
+    bootc upgrade
+    let out = bootc apply-live bound-images
+    print $out
+    assert ($out | str contains $"restart: ($unit)")
+    systemctl is-active $unit
+    assert equal (running_image) $image_v2
     tap ok
 }
 

@@ -31,7 +31,8 @@
 //! removal or a `ServiceName=` rename, and units reverting to the booted
 //! definition when a stale override is removed -- are recorded in two
 //! small flat lists under `/run/bootc/apply-live/` (see [`UnitActions`]),
-//! written before `/run/containers/systemd/` changes. Re-running the
+//! written before `/run/containers/systemd/` changes; a third one keeps
+//! the units an apply stopped (see [`STOPPED_UNITS_LIST`]). Re-running the
 //! command re-derives everything from that directory (see
 //! [`scan_live_quadlets`]) plus those lists, so a failure part way through
 //! -- including a failed stop -- is safe to resume from.
@@ -71,6 +72,11 @@ const PENDING_STOPS_LIST: &str = "bootc/apply-live/pending-stops.list";
 /// no `/run` override that still need restarting after `daemon-reload`;
 /// see [`UnitActions`].
 const PENDING_RESTARTS_LIST: &str = "bootc/apply-live/pending-restarts.list";
+/// Flat, one-unit-per-line list (relative to `/run`) of the units an apply
+/// stopped because the staged deployment no longer defined them. Nothing
+/// else records them (a removal leaves no override behind), and a later
+/// apply whose staged deployment defines one again has to start it.
+const STOPPED_UNITS_LIST: &str = "bootc/apply-live/stopped-units.list";
 /// The staged checksum (relative to `/run`) whose definitions have all been
 /// written to [`QUADLET_RUN_DIR`] and whose unit operations are recorded.
 /// Removals and pull-only definitions leave nothing in [`QUADLET_RUN_DIR`],
@@ -626,9 +632,11 @@ fn defined_units(root: &Dir) -> Result<BTreeSet<String>> {
 /// Every unit that may be running from a definition this apply replaces,
 /// removes or reverts is a candidate, as are the operations `previous` runs
 /// left pending. A candidate the staged deployment no longer defines is
-/// stopped; one it still defines is restarted, unless it has a `/run`
-/// override in `materialized`, whose marker covers its restart (and which
-/// must not be stopped, as it keeps running).
+/// stopped; one it still defines is restarted, unless this apply writes a
+/// `/run` override for it, whose marker covers its restart (and which must
+/// not be stopped, as it keeps running). Units in `stopped` (see
+/// [`STOPPED_UNITS_LIST`]) that the staged deployment defines again are
+/// restarted too.
 fn plan_unit_actions(
     changes: &[QuadletChange],
     stale: &[&LiveQuadlet],
@@ -636,7 +644,11 @@ fn plan_unit_actions(
     booted_specs: &[BoundImageSpec],
     defined: &BTreeSet<String>,
     previous: UnitActions,
+    stopped: &BTreeSet<String>,
 ) -> Result<UnitActions> {
+    // A stop left pending (say by `--no-restart`) of a unit the staged
+    // deployment defines again becomes a restart: its override may be gone
+    // already, while the unit still runs that definition.
     let mut candidates = previous.stop;
     candidates.extend(previous.restart);
     let relpaths = changes
@@ -650,6 +662,8 @@ fn plan_unit_actions(
         candidates.extend(unit_at(booted_specs, relpath)?);
     }
 
+    // A stopped unit that is still undefined stays stopped, with nothing to do.
+    candidates.extend(stopped.intersection(defined).cloned());
     let materialized: BTreeSet<&str> = changes
         .iter()
         .filter(|c| matches!(c.kind, ChangeKind::Added | ChangeKind::Updated))
@@ -790,6 +804,7 @@ fn stop_unit(unit: &str) -> Result<()> {
 /// Carry out `actions` and restart the units of the overrides in `live`
 /// still marked pending, clearing each record only once its operations
 /// succeeded, so a failure part way through can be retried on the next run.
+/// Keeps [`STOPPED_UNITS_LIST`] up to date along the way.
 fn run_unit_actions(
     rootfs: &Dir,
     run: &Dir,
@@ -797,22 +812,32 @@ fn run_unit_actions(
     live: &[LiveQuadlet],
     sepolicy: Option<&ostree_ext::ostree::SePolicy>,
 ) -> Result<()> {
+    let mut stopped = read_list(run, STOPPED_UNITS_LIST)?;
     // Stop before reloading, while the old definitions are still loaded.
     for unit in &actions.stop {
         stop_unit(unit)?;
+        // Right away: if a later stop fails, this one still happened.
+        if stopped.insert(unit.clone()) {
+            write_list(run, STOPPED_UNITS_LIST, &stopped)?;
+        }
     }
     actions.stop.clear();
     actions.store(run)?;
     systemctl(&["daemon-reload"])?;
     for unit in &actions.restart {
         systemctl(&["restart", unit])?;
+        stopped.remove(unit);
     }
     actions.restart.clear();
+    write_list(run, STOPPED_UNITS_LIST, &stopped)?;
     actions.store(run)?;
     for q in live.iter().filter(|q| q.pending) {
         if let Some(unit) = q.unit.as_deref() {
             // `restart` also starts a unit which is not running (the added case).
             systemctl(&["restart", unit])?;
+            if stopped.remove(unit) {
+                write_list(run, STOPPED_UNITS_LIST, &stopped)?;
+            }
         }
         set_quadlet_marker(rootfs, q, false, sepolicy)?;
     }
@@ -1049,6 +1074,7 @@ pub(crate) async fn apply_bound_images(
         check_diff_scope(&diff, &changes, &booted_root, &staged_root)?;
     }
 
+    let stopped = read_list(run, STOPPED_UNITS_LIST)?;
     let actions = plan_unit_actions(
         &changes,
         &stale,
@@ -1056,6 +1082,7 @@ pub(crate) async fn apply_bound_images(
         &booted_specs,
         &defined_units(&staged_root)?,
         previous,
+        &stopped,
     )?;
     if changes.is_empty() && stale.is_empty() && actions.is_empty() {
         println!("No bound image changes to apply");
@@ -1604,6 +1631,7 @@ mod tests {
             &booted,
             &defined_units(staged_root)?,
             UnitActions::default(),
+            &BTreeSet::new(),
         )?;
         assert!(actions.stop.is_empty(), "{actions:?}");
         assert_eq!(actions.restart, BTreeSet::from(["foo.service".to_string()]));
@@ -1655,6 +1683,7 @@ mod tests {
             unbound: Vec<BoundImageSpec>,
             live: Option<LiveQuadlet>,
             previous: UnitActions,
+            stopped: &'static [&'static str],
             stop: &'static [&'static str],
             restart: &'static [&'static str],
         }
@@ -1666,6 +1695,7 @@ mod tests {
                 unbound: vec![],
                 live: None,
                 previous: UnitActions::default(),
+                stopped: &[],
                 stop: &[],
                 restart: &[],
             },
@@ -1676,6 +1706,7 @@ mod tests {
                 unbound: vec![],
                 live: None,
                 previous: UnitActions::default(),
+                stopped: &[],
                 stop: &["foo.service"],
                 restart: &[],
             },
@@ -1686,6 +1717,7 @@ mod tests {
                 unbound: vec![],
                 live: Some(live("v2", Some("bar"))),
                 previous: UnitActions::default(),
+                stopped: &[],
                 stop: &["bar.service", "foo.service"],
                 restart: &[],
             },
@@ -1696,6 +1728,7 @@ mod tests {
                 unbound: vec![],
                 live: None,
                 previous: UnitActions::default(),
+                stopped: &[],
                 stop: &["foo.service"],
                 restart: &[],
             },
@@ -1706,6 +1739,7 @@ mod tests {
                 unbound: vec![],
                 live: Some(live("v2", Some("bar"))),
                 previous: UnitActions::default(),
+                stopped: &[],
                 stop: &["bar.service", "foo.service"],
                 restart: &[],
             },
@@ -1716,6 +1750,7 @@ mod tests {
                 unbound: vec![],
                 live: Some(live("v2", None)),
                 previous: UnitActions::default(),
+                stopped: &[],
                 stop: &[],
                 restart: &["foo.service"],
             },
@@ -1726,6 +1761,7 @@ mod tests {
                 unbound: vec![],
                 live: Some(live("v2", Some("bar"))),
                 previous: UnitActions::default(),
+                stopped: &[],
                 stop: &["bar.service"],
                 restart: &["foo.service"],
             },
@@ -1736,6 +1772,7 @@ mod tests {
                 unbound: vec![],
                 live: Some(live("v2", None)),
                 previous: UnitActions::default(),
+                stopped: &[],
                 stop: &[],
                 restart: &[],
             },
@@ -1749,6 +1786,7 @@ mod tests {
                     stop: units(&["foo.service"]),
                     restart: BTreeSet::new(),
                 },
+                stopped: &[],
                 stop: &[],
                 restart: &["foo.service"],
             },
@@ -1762,6 +1800,7 @@ mod tests {
                     stop: BTreeSet::new(),
                     restart: units(&["foo.service"]),
                 },
+                stopped: &[],
                 stop: &["foo.service"],
                 restart: &[],
             },
@@ -1772,8 +1811,31 @@ mod tests {
                 unbound: vec![def(USR, "v1", None)],
                 live: Some(live("v2", None)),
                 previous: UnitActions::default(),
+                stopped: &[],
                 stop: &[],
                 restart: &["foo.service"],
+            },
+            Case {
+                name: "a unit an earlier removal stopped is started once staged defines it again",
+                booted: vec![def(USR, "v1", None)],
+                staged: vec![def(USR, "v1", None)],
+                unbound: vec![],
+                live: None,
+                previous: UnitActions::default(),
+                stopped: &["foo.service"],
+                stop: &[],
+                restart: &["foo.service"],
+            },
+            Case {
+                name: "a unit an earlier removal stopped stays stopped while undefined",
+                booted: vec![def(USR, "v1", None)],
+                staged: vec![],
+                unbound: vec![],
+                live: None,
+                previous: UnitActions::default(),
+                stopped: &["bar.service"],
+                stop: &["foo.service"],
+                restart: &[],
             },
         ];
         for case in cases {
@@ -1802,6 +1864,7 @@ mod tests {
                 &case.booted,
                 &defined_units(staged_root)?,
                 case.previous,
+                &units(case.stopped),
             )?;
             assert_eq!(actions.stop, units(case.stop), "{}", case.name);
             assert_eq!(actions.restart, units(case.restart), "{}", case.name);
