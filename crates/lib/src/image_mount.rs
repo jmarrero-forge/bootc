@@ -12,7 +12,7 @@ use cap_std_ext::cap_std::{ambient_authority, fs::Dir};
 use clap::{Args, ValueEnum};
 use composefs_ctl::composefs::fsverity::{FsVerityHashValue, Sha512HashValue};
 use ostree::gio;
-use ostree_ext::{ostree, ostree_prepareroot, sysroot::SysrootLock};
+use ostree_ext::{ostree, ostree_prepareroot};
 use rustix::fs::{AtFlags, CWD, Mode, OFlags, StatxFlags, openat, statx};
 use rustix::mount::{
     MoveMountFlags, OpenTreeFlags, UnmountFlags, move_mount, open_tree, unmount as unmount_path,
@@ -50,7 +50,7 @@ pub(crate) struct UnmountOpts {
 
 struct MountedImageRoot {
     tree: OwnedFd,
-    // Keep the repository/sysroot locked while cloning and attaching its tree.
+    // Keep the composefs repository open while cloning and attaching its tree.
     _storage: StorageGuard,
     // A non-composefs OSTree checkout, whose /etc is deployment-local state
     // rather than image content.
@@ -61,12 +61,12 @@ enum StorageGuard {
     Composefs {
         _repo: crate::store::ComposefsRepository,
     },
-    Ostree {
-        _sysroot: SysrootLock,
-    },
+    // OSTree's sysroot lock can't be taken without writing to /sysroot; see
+    // mount_ostree_image().
+    Ostree,
 }
 
-pub(crate) async fn mount(opts: MountOpts) -> Result<()> {
+pub(crate) fn mount(opts: MountOpts) -> Result<()> {
     source_relative_path(&opts.source)?;
     let composefs_booted = crate::bootc_composefs::status::composefs_booted()?;
     // Select only from the active backend. These lookups are deliberately
@@ -82,7 +82,7 @@ pub(crate) async fn mount(opts: MountOpts) -> Result<()> {
         };
         mount_composefs_image(&opts, id, allow_missing_fsverity)?
     } else {
-        mount_ostree_image(&opts).await?
+        mount_ostree_image(&opts)?
     };
     let MountedImageRoot {
         tree,
@@ -206,21 +206,23 @@ fn mount_composefs_image(
     })
 }
 
-async fn mount_ostree_image(opts: &MountOpts) -> Result<MountedImageRoot> {
-    // Open /sysroot through a retained directory fd and do the same narrow
-    // load/lock sequence used by install-mount. In particular, do not call
-    // prepare_for_write() or initialize boot storage for this read-only query.
+fn mount_ostree_image(opts: &MountOpts) -> Result<MountedImageRoot> {
+    // Load the booted sysroot read-only. In particular, do not call
+    // prepare_for_write(): it remounts /sysroot read-write in a private mount
+    // namespace, where the final mount would not be visible to the caller.
+    // For the same reason, OSTree's sysroot lock is not taken: it needs a
+    // writable /sysroot, since the lock file is created and removed on each
+    // use. A cleanup that removes the selected deployment concurrently makes
+    // the steps below fail.
+    //
+    // OSTree only finds the booted deployment when loading the default
+    // sysroot path, so don't go through a /proc/self/fd path here.
     let sysroot_dir = Dir::open_ambient_dir("/sysroot", ambient_authority())
         .context("Opening booted system sysroot")?;
-    let path = format!("/proc/self/fd/{}", sysroot_dir.as_raw_fd());
-    let sysroot_file = gio::File::for_path(path);
-    let sysroot = ostree::Sysroot::new(Some(&sysroot_file));
+    let sysroot = ostree::Sysroot::new_default();
     sysroot
         .load(gio::Cancellable::NONE)
         .context("Loading booted OSTree sysroot")?;
-    let sysroot = SysrootLock::new_from_sysroot(&sysroot)
-        .await
-        .context("Locking booted OSTree sysroot")?;
 
     let deployment = match opts.deployment {
         Deployment::Booted => sysroot
@@ -238,7 +240,6 @@ async fn mount_ostree_image(opts: &MountOpts) -> Result<MountedImageRoot> {
                 .ok_or_else(|| anyhow::anyhow!("No staged OSTree deployment found"))?
         }
     };
-    let sysroot_dir = crate::utils::sysroot_dir(&sysroot)?;
     let deployment_path = sysroot.deployment_dirpath(&deployment);
     let deployment_dir = sysroot_dir
         .open_dir(deployment_path.as_str())
@@ -269,7 +270,7 @@ async fn mount_ostree_image(opts: &MountOpts) -> Result<MountedImageRoot> {
     };
     Ok(MountedImageRoot {
         tree,
-        _storage: StorageGuard::Ostree { _sysroot: sysroot },
+        _storage: StorageGuard::Ostree,
         checkout,
     })
 }

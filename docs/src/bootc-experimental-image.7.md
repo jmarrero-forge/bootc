@@ -58,6 +58,11 @@ only the mount you intend to remove. Mount attachment follows the propagation
 behavior of the target mount namespace; use a private mount namespace if
 propagation is undesired.
 
+A mount does not keep its deployment alive: if the deployment is removed later,
+for example when another update is staged in its place, reading from the
+mount can fail. Unmount it and mount the content of the current deployment
+again.
+
 Example workflow:
 
 ```
