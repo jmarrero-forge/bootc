@@ -2500,7 +2500,7 @@ async fn run_from_opt(opt: Opt) -> Result<CliExitStatus> {
                     .pull_from_host_storage(&image)
                     .await
             }
-            ImageOpts::Mount(opts) => crate::image_mount::mount(opts).await,
+            ImageOpts::Mount(opts) => crate::image_mount::mount(opts),
             ImageOpts::Unmount(opts) => crate::image_mount::unmount(opts),
             ImageOpts::Cmd(opt) => {
                 let storage = get_storage().await?;

@@ -19,11 +19,14 @@ Run `bootc image copy-to-storage --help` for more options.
 
 `bootc image mount` exposes a path from the locally available booted or staged
 deployment image at an existing empty directory. The source must be a directory;
-`--source /` selects the image root. It refuses target paths with symlink
-components and targets that are already mountpoints. It does not pull an image
-or merge deployment state: `/var` is never mounted from host state, and OSTree
-checkout fallbacks use the image's pristine `/usr/etc` rather than deployment-local
-`/etc`. The target is checked immediately before attachment; callers must prevent
+`--source /` selects the image root. Symlinks in the target path are resolved
+(on bootc systems `/mnt` is usually a symlink to `/var/mnt`), and targets that
+are already mountpoints are refused. It does not pull an image
+or merge deployment state: `/var` is never mounted from host state. On an
+OSTree deployment that does not use composefs, `/etc` holds the deployment's
+merged configuration rather than image content, so `--source /` and sources at
+or below `/etc` are refused there; the image defaults are in `/usr/etc`. The
+target is checked immediately before attachment; callers must prevent
 concurrent changes to the target directory while the command runs.
 
 ```sh
@@ -55,6 +58,11 @@ created it. It does not track or verify bootc provenance, so take care to name
 only the mount you intend to remove. Mount attachment follows the propagation
 behavior of the target mount namespace; use a private mount namespace if
 propagation is undesired.
+
+A mount does not keep its deployment alive: if the deployment is removed later,
+for example when another update is staged in its place, reading from the
+mount can fail. Unmount it and mount the content of the current deployment
+again.
 
 Example workflow:
 
