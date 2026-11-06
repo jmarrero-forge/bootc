@@ -49,12 +49,17 @@ pub(crate) struct UnmountOpts {
 }
 
 struct MountedImageRoot {
-    tree: OwnedFd,
+    root: ImageRoot,
     // Keep the composefs repository open while cloning and attaching its tree.
     _storage: StorageGuard,
-    // A non-composefs OSTree checkout, whose /etc is deployment-local state
-    // rather than image content.
-    checkout: bool,
+}
+
+enum ImageRoot {
+    /// A detached mount of the image (composefs, also for OSTree).
+    Detached(OwnedFd),
+    /// A plain OSTree checkout in the attached /sysroot. Its /etc is
+    /// deployment-local state rather than image content.
+    Checkout(Dir),
 }
 
 enum StorageGuard {
@@ -84,24 +89,31 @@ pub(crate) fn mount(opts: MountOpts) -> Result<()> {
     } else {
         mount_ostree_image(&opts)?
     };
-    let MountedImageRoot {
-        tree,
-        _storage,
-        checkout,
-    } = image;
+    let MountedImageRoot { root, _storage } = image;
 
-    if checkout {
-        ensure_source_outside_checkout_etc(&opts.source)?;
-    }
-    bootc_initramfs_setup::set_mount_tree_readonly(&tree)
-        .context("Making selected deployment image read-only")?;
-
-    let image_root = Dir::reopen_dir(&tree).context("Opening selected image root")?;
+    let (image_root, detached_tree) = match &root {
+        ImageRoot::Detached(tree) => {
+            // Restrict the whole tree up front, since the pre-6.15 fallback
+            // below briefly attaches all of it.
+            bootc_initramfs_setup::set_mount_tree_readonly_nosymfollow(tree)
+                .context("Making selected image read-only and preventing symlink traversal")?;
+            let image_root = Dir::reopen_dir(tree).context("Opening selected image root")?;
+            (image_root, Some(tree))
+        }
+        ImageRoot::Checkout(deployment) => {
+            ensure_source_outside_checkout_etc(&opts.source)?;
+            let image_root = deployment
+                .try_clone()
+                .context("Opening selected OSTree checkout")?;
+            (image_root, None)
+        }
+    };
     let source = open_source(&image_root, &opts.source)?;
     // Open once and retain this descriptor through validation and attachment.
     // This avoids checking one pathname and mounting on a replacement object.
-    let (target, target_parent) = open_mount_target(&opts.target)?;
+    let (resolved_target, target, target_parent) = open_target(&opts.target, true)?;
     ensure_not_root_target(&target, &opts.target)?;
+    let target_parent = target_parent.context("mount target must not be filesystem root")?;
     let source_metadata = source.metadata().context("Inspecting image source")?;
     let target_metadata = target
         .metadata()
@@ -113,22 +125,23 @@ pub(crate) fn mount(opts: MountOpts) -> Result<()> {
         opts.target
     );
 
-    let source_path = format!("/proc/self/fd/{}", source.as_raw_fd());
-    let source_tree = open_tree(
-        CWD,
-        source_path.as_str(),
-        OpenTreeFlags::OPEN_TREE_CLONE | OpenTreeFlags::OPEN_TREE_CLOEXEC,
-    )
-    .with_context(|| format!("Cloning image source {}", opts.source))?;
+    // Check immediately before cloning and attaching, so a changed target
+    // cannot silently hide newly-added contents or stack another mount.
+    ensure_directory_empty(&target, &opts.target)?;
+    ensure_not_mountpoint(&target, &target_parent, &opts.target)?;
+
+    // A checkout is cloned straight from /sysroot, which works on any kernel.
+    let source_tree = match (clone_source(&source), detached_tree) {
+        (Ok(source_tree), _) => source_tree,
+        (Err(rustix::io::Errno::INVAL), Some(tree)) => {
+            clone_source_via_target(tree, &source, &target, &target_parent, &resolved_target)?
+        }
+        (Err(e), _) => {
+            return Err(e).with_context(|| format!("Cloning image source {}", opts.source));
+        }
+    };
     bootc_initramfs_setup::set_mount_tree_readonly_nosymfollow(&source_tree)
         .context("Making selected image content read-only and preventing symlink traversal")?;
-
-    // Check immediately before attachment so a changed target cannot silently
-    // hide newly-added contents or stack another mount.
-    ensure_directory_empty(&target, &opts.target)?;
-    if let Some(parent) = target_parent.as_ref() {
-        ensure_not_mountpoint(&target, parent, &opts.target)?;
-    }
 
     move_mount(
         &source_tree,
@@ -140,6 +153,57 @@ pub(crate) fn mount(opts: MountOpts) -> Result<()> {
     .with_context(|| format!("Attaching image source {} at {}", opts.source, opts.target))?;
 
     Ok(())
+}
+
+fn clone_source(source: &std::fs::File) -> rustix::io::Result<OwnedFd> {
+    let source_path = format!("/proc/self/fd/{}", source.as_raw_fd());
+    open_tree(
+        CWD,
+        source_path.as_str(),
+        OpenTreeFlags::OPEN_TREE_CLONE | OpenTreeFlags::OPEN_TREE_CLOEXEC,
+    )
+}
+
+/// Before Linux 6.15, open_tree() can only clone from mounts in the caller's
+/// mount namespace, not from a detached tree such as a freshly mounted image.
+/// Attach the image root at the (validated, empty) target for the moment,
+/// clone the source from there, then detach the root again. The root is
+/// image content only, already restricted like the final mount.
+fn clone_source_via_target(
+    tree: &OwnedFd,
+    source: &std::fs::File,
+    target: &std::fs::File,
+    target_parent: &std::fs::File,
+    resolved_target: &Utf8Path,
+) -> Result<OwnedFd> {
+    let name = resolved_target
+        .file_name()
+        .context("Mount target has no final path component")?;
+    move_mount(
+        tree,
+        "",
+        target,
+        "",
+        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH | MoveMountFlags::MOVE_MOUNT_T_EMPTY_PATH,
+    )
+    .with_context(|| format!("Temporarily attaching image root at {resolved_target}"))?;
+    let cloned = clone_source(source);
+    // The descriptors for the image root keep it busy, so detach it lazily.
+    let detached = unmount_path(
+        format!("/proc/self/fd/{}/{name}", target_parent.as_raw_fd()).as_str(),
+        UnmountFlags::DETACH | UnmountFlags::NOFOLLOW,
+    )
+    .with_context(|| {
+        format!("Detaching temporary image root from {resolved_target}; unmount it by hand")
+    });
+    match (cloned, detached) {
+        (Ok(cloned), Ok(())) => Ok(cloned),
+        (Err(e), Ok(())) => Err(e).context("Cloning image source from the attached image root"),
+        (Ok(_), Err(e)) => Err(e),
+        (Err(clone_err), Err(e)) => Err(e.context(format!(
+            "after cloning the image source failed: {clone_err}"
+        ))),
+    }
 }
 
 /// Read the composefs staged selector without constructing `BootedStorage`.
@@ -200,9 +264,8 @@ fn mount_composefs_image(
         .mount(&id)
         .with_context(|| format!("Mounting {:?} composefs deployment {id}", opts.deployment))?;
     Ok(MountedImageRoot {
-        tree,
+        root: ImageRoot::Detached(tree),
         _storage: StorageGuard::Composefs { _repo: repo },
-        checkout: false,
     })
 }
 
@@ -249,7 +312,7 @@ fn mount_ostree_image(opts: &MountOpts) -> Result<MountedImageRoot> {
         .context("Opening booted OSTree repository")?;
     let config = ostree_prepareroot::load_config_from_root(&deployment_dir)
         .context("Loading selected deployment's prepare-root.conf")?;
-    let (tree, checkout) = match ostree_prepareroot::mount_composefs(
+    let root = match ostree_prepareroot::mount_composefs(
         &deployment_dir,
         &repo,
         deployment.csum().as_str(),
@@ -257,21 +320,12 @@ fn mount_ostree_image(opts: &MountOpts) -> Result<MountedImageRoot> {
     )
     .context("Mounting selected OSTree deployment image")?
     {
-        Some(tree) => (tree, false),
-        None => (
-            open_tree(
-                &sysroot_dir,
-                deployment_path.as_str(),
-                OpenTreeFlags::OPEN_TREE_CLONE | OpenTreeFlags::OPEN_TREE_CLOEXEC,
-            )
-            .context("Cloning selected OSTree deployment checkout")?,
-            true,
-        ),
+        Some(tree) => ImageRoot::Detached(tree),
+        None => ImageRoot::Checkout(deployment_dir),
     };
     Ok(MountedImageRoot {
-        tree,
+        root,
         _storage: StorageGuard::Ostree,
-        checkout,
     })
 }
 
@@ -388,10 +442,6 @@ pub(crate) fn unmount(opts: UnmountOpts) -> Result<()> {
     unmount_path(fd_path.as_str(), UnmountFlags::NOFOLLOW)
         .with_context(|| format!("Unmounting {}", opts.target))?;
     Ok(())
-}
-
-fn open_mount_target(path: &Utf8Path) -> Result<(std::fs::File, Option<std::fs::File>)> {
-    open_target(path, true).map(|(_, target, parent)| (target, parent))
 }
 
 /// Resolve symlinks in a caller-supplied target first: bootc systems commonly
@@ -523,7 +573,7 @@ fn ensure_not_root_target(target: &std::fs::File, path: &Utf8Path) -> Result<()>
 mod tests {
     use super::{
         Deployment, MountOpts, UnmountOpts, ensure_directory_empty, ensure_not_mountpoint,
-        ensure_not_root_target, open_mount_target, open_path_no_symlinks, open_source, open_target,
+        ensure_not_root_target, open_path_no_symlinks, open_source, open_target,
         source_relative_path,
     };
     use crate::cli::{ImageOpts, InstallOpts, Opt};
@@ -534,6 +584,12 @@ mod tests {
 
     fn open_existing_path(path: &Utf8Path) -> anyhow::Result<std::fs::File> {
         open_target(path, false).map(|(_, target, _)| target)
+    }
+
+    fn open_mount_target(
+        path: &Utf8Path,
+    ) -> anyhow::Result<(std::fs::File, Option<std::fs::File>)> {
+        open_target(path, true).map(|(_, target, parent)| (target, parent))
     }
 
     #[test]
