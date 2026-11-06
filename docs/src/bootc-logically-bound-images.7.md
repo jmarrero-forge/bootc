@@ -87,13 +87,14 @@ the image is reported this way, since the local copy wins in `/etc`.
 
 Because `/run` is transient, the override disappears on the next boot, at
 which point the staged deployment's own content applies. (A soft reboot
-preserves `/run`; the override is cleared when one is prepared.) The applied
-state is shown in `bootc status`. Each quadlet written to
-`/run/containers/systemd/` carries a leading marker comment (checksum,
-pending restart, and any unit still needing a stop); a small flat list under
-`/run/bootc/apply-live/` protects the staged images from garbage collection
-until reboot, and records pending stops for pure removals, even if the staged
-deployment is discarded (for example by `bootc rollback`).
+preserves `/run`; the override is cleared when one is prepared.) The quadlets
+applied this way are shown in `bootc status`. Each quadlet written to
+`/run/containers/systemd/` carries a leading marker comment (checksum and
+whether its unit still needs a restart). Small flat lists under
+`/run/bootc/apply-live/` protect the staged images from garbage collection
+until reboot, even if the staged deployment is discarded (for example by
+`bootc rollback`), and record the units still to be stopped (removed or
+renamed units) or restarted (units reverting to the booted definition).
 
 Limitations: only the `.container` or `.image` file referenced from
 `bound-images.d` is applied. Quadlet drop-ins (`*.container.d/`) and other
