@@ -371,19 +371,27 @@ fn source_relative_path(source: &Utf8Path) -> Result<Utf8PathBuf> {
 }
 
 pub(crate) fn unmount(opts: UnmountOpts) -> Result<()> {
-    // Pin the object named by the explicit target and ask the kernel to unmount
-    // through its procfs fd link. The kernel rejects the operation unless this
-    // descriptor resolves to a mount root; no recursive flag is used.
-    let target = open_existing_path(&opts.target)?;
+    let (target, parent) = open_path_no_symlinks(&opts.target, false)?;
     ensure_not_root_target(&target, &opts.target)?;
-    let fd_path = format!("/proc/self/fd/{}", target.as_raw_fd());
-    unmount_path(fd_path.as_str(), UnmountFlags::empty())
+    let parent = parent.context("Refusing to unmount the root filesystem")?;
+    ensure!(
+        mount_id(&target)? != mount_id(&parent)?,
+        "{} is not a mountpoint",
+        opts.target
+    );
+    // Any descriptor for the mount root, even O_PATH, holds a reference to the
+    // mount that makes a non-lazy unmount fail with EBUSY. Release it and
+    // unmount by name relative to the retained parent instead, so the path
+    // is still resolved from the directory validated above.
+    drop(target);
+    let name = opts
+        .target
+        .file_name()
+        .context("Mount target has no final path component")?;
+    let fd_path = format!("/proc/self/fd/{}/{name}", parent.as_raw_fd());
+    unmount_path(fd_path.as_str(), UnmountFlags::NOFOLLOW)
         .with_context(|| format!("Unmounting {}", opts.target))?;
     Ok(())
-}
-
-fn open_existing_path(path: &Utf8Path) -> Result<std::fs::File> {
-    open_path_no_symlinks(path, false).map(|(target, _)| target)
 }
 
 fn open_mount_target(path: &Utf8Path) -> Result<(std::fs::File, Option<std::fs::File>)> {
@@ -504,7 +512,7 @@ fn ensure_not_root_target(target: &std::fs::File, path: &Utf8Path) -> Result<()>
 mod tests {
     use super::{
         Deployment, MountOpts, UnmountOpts, ensure_directory_empty, ensure_not_mountpoint,
-        ensure_not_root_target, open_existing_path, open_mount_target, open_source,
+        ensure_not_root_target, open_mount_target, open_path_no_symlinks, open_source,
         source_relative_path,
     };
     use crate::cli::{ImageOpts, InstallOpts, Opt};
@@ -512,6 +520,10 @@ mod tests {
     use cap_std_ext::cap_std::ambient_authority;
     use clap::Parser;
     use std::os::unix::fs::symlink;
+
+    fn open_existing_path(path: &Utf8Path) -> anyhow::Result<std::fs::File> {
+        open_path_no_symlinks(path, false).map(|(target, _)| target)
+    }
 
     #[test]
     fn parses_image_mount_and_unmount_without_changing_install_mount() {
@@ -584,6 +596,17 @@ mod tests {
         symlink("/", &root_alias).unwrap();
         let root_alias = Utf8PathBuf::from_path_buf(root_alias).unwrap();
         assert!(open_existing_path(&root_alias).is_err());
+    }
+
+    #[test]
+    fn unmount_refuses_non_mountpoints() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = Utf8PathBuf::from_path_buf(temp.path().to_owned()).unwrap();
+        let err = super::unmount(UnmountOpts { target }).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("is not a mountpoint"),
+            "{err:#}"
+        );
     }
 
     #[test]
