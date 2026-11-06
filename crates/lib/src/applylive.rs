@@ -889,24 +889,78 @@ fn already_materialized(
     materialization_complete(changes, live_by_path, staged_csum, rootfs)
 }
 
-/// Refuse to clobber a `/run` quadlet bootc didn't write. Runs before any
-/// pull or write so a conflict can't leave a half-applied `/run` state.
-fn check_run_destinations(
+/// Map each file name in the quadlet search directory `dir` (relative to
+/// `/`, subdirectories included) to the path of the file podman uses for
+/// it, skipping the paths `skip` accepts.
+fn quadlets_by_name(
+    rootfs: &Dir,
+    dir: &str,
+    skip: impl Fn(&Utf8Path) -> bool,
+) -> Result<BTreeMap<String, String>> {
+    let mut paths = Vec::new();
+    walk_quadlets(rootfs, &format!("/{dir}"), &mut paths)?;
+    let mut ret = BTreeMap::new();
+    for path in paths {
+        let Some(name) = Utf8Path::new(&path).file_name() else {
+            continue;
+        };
+        if !skip(Utf8Path::new(&path)) {
+            ret.entry(name.to_owned()).or_insert(path);
+        }
+    }
+    Ok(ret)
+}
+
+/// Refuse changes whose result on the running system would differ from
+/// what a reboot into the staged deployment gives. Runs before any pull or
+/// write so a conflict can't leave a half-applied `/run` state.
+///
+/// Podman's quadlet generator uses one quadlet per file name, whichever
+/// subdirectory it is in, so quadlets are matched by file name:
+///
+/// - A `/run` quadlet bootc didn't write, where a change would write or
+///   remove one, belongs to someone else and is left alone.
+/// - A vendor definition with an `/etc` quadlet of the same name: the
+///   administrator's definition wins in `/etc`, and keeps winning after a
+///   reboot, but a copy of the vendor one in `/run` would override it, and
+///   removing the vendor one would stop the unit the `/etc` one defines.
+fn check_destinations(
     rootfs: &Dir,
     changes: &[QuadletChange],
     live_by_path: &BTreeMap<&Utf8Path, &LiveQuadlet>,
 ) -> Result<()> {
-    let quadlet_run_dir = Utf8Path::new(QUADLET_RUN_DIR);
+    let run_prefix = format!("/{QUADLET_RUN_DIR}/");
+    // Symlinks included: a quadlet masked with `-> /dev/null` is just as
+    // much someone else's.
+    let foreign_run = quadlets_by_name(rootfs, QUADLET_RUN_DIR, |p| {
+        p.as_str()
+            .strip_prefix(&run_prefix)
+            .is_some_and(|rel| live_by_path.contains_key(Utf8Path::new(rel)))
+    })?;
+    let etc = quadlets_by_name(rootfs, ETC_QUADLET_DIR, |_| false)?;
     for c in changes {
-        if !matches!(c.kind, ChangeKind::Added | ChangeKind::Updated) {
-            continue;
-        }
-        let Some(quadlet) = c.quadlet.as_deref() else {
+        let Some(name) = c.quadlet.as_deref().and_then(Utf8Path::file_name) else {
             continue;
         };
-        let dest = quadlet_run_dir.join(quadlet);
-        if !live_by_path.contains_key(quadlet) && rootfs.try_exists(&dest)? {
-            anyhow::bail!("Refusing to overwrite non-bootc quadlet override at /{dest}");
+        if let Some(path) = foreign_run.get(name) {
+            anyhow::bail!("Refusing to change non-bootc quadlet override at {path}");
+        }
+        if !c.spec.path.starts_with(VENDOR_QUADLET_DIR) {
+            continue;
+        }
+        let Some(etc_path) = etc.get(name) else {
+            continue;
+        };
+        // The bound definition moving from /etc to the vendor directory
+        // removes the /etc one in the same deployment.
+        let moved_from_etc = changes
+            .iter()
+            .any(|r| r.kind == ChangeKind::Removed && format!("/{}", r.spec.path) == *etc_path);
+        if !moved_from_etc {
+            anyhow::bail!(
+                "{etc_path} overrides the bound definition /{}; a reboot is required to apply it",
+                c.spec.path
+            );
         }
     }
     Ok(())
@@ -969,6 +1023,9 @@ pub(crate) async fn apply_bound_images(
             println!("Bound images from staged deployment are already applied");
             return Ok(());
         }
+        // Again, as an administrator may have added a conflicting quadlet
+        // since (e.g. after `--no-restart`).
+        check_destinations(rootfs, &changes, &live_by_path)?;
         for unit in &previous.stop {
             println!("stop pending: {unit}");
         }
@@ -1018,13 +1075,12 @@ pub(crate) async fn apply_bound_images(
     for unit in &actions.restart {
         println!("restart: {unit}");
     }
+    // Before any pull/write: a conflict must not leave a half-applied
+    // `/run` state that an unrelated daemon-reload could pick up.
+    check_destinations(rootfs, &changes, &live_by_path)?;
     if opts.dry_run {
         return Ok(());
     }
-
-    // Ownership before any pull/write: a conflict must not leave a
-    // half-applied `/run` state that an unrelated daemon-reload could pick up.
-    check_run_destinations(rootfs, &changes, &live_by_path)?;
 
     // From here on `/run` changes, so until this apply is complete a re-run
     // must take the full path again.
@@ -1862,6 +1918,159 @@ mod tests {
             &[],
             &live_by_path
         )?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_destinations() -> Result<()> {
+        let contents = "[Container]\nImage=quay.io/foo/foo:v2\n";
+        let change = |kind, dir: &str| QuadletChange {
+            kind,
+            spec: spec(
+                &format!("{dir}/foo.container"),
+                "quay.io/foo/foo:v2",
+                contents,
+            ),
+            quadlet: Some("foo.container".into()),
+            unit: Some("foo.service".into()),
+        };
+        let run_quadlet = format!("{QUADLET_RUN_DIR}/foo.container");
+        let etc_quadlet = format!("{ETC_QUADLET_DIR}/foo.container");
+        let owned = format!(
+            "{}{contents}",
+            marker_line("abc123", false, "quay.io/foo/foo:v2")
+        );
+        enum File {
+            /// A quadlet bootc wrote
+            Owned,
+            Regular(&'static str),
+            Symlink(&'static str),
+        }
+        // (description, changes, files on the host, expected error)
+        let cases: Vec<(&str, Vec<QuadletChange>, Vec<(&str, File)>, Option<&str>)> = vec![
+            (
+                "nothing in the way",
+                vec![change(ChangeKind::Updated, VENDOR_QUADLET_DIR)],
+                vec![],
+                None,
+            ),
+            (
+                "our own override",
+                vec![change(ChangeKind::Updated, VENDOR_QUADLET_DIR)],
+                vec![(run_quadlet.as_str(), File::Owned)],
+                None,
+            ),
+            (
+                "someone else's override",
+                vec![change(ChangeKind::Updated, VENDOR_QUADLET_DIR)],
+                vec![(run_quadlet.as_str(), File::Regular("[Container]\n"))],
+                Some("non-bootc quadlet override"),
+            ),
+            (
+                "someone else's override of a removed quadlet",
+                vec![change(ChangeKind::Removed, VENDOR_QUADLET_DIR)],
+                vec![(run_quadlet.as_str(), File::Regular("[Container]\n"))],
+                Some("non-bootc quadlet override"),
+            ),
+            (
+                "a masked override",
+                vec![change(ChangeKind::Added, VENDOR_QUADLET_DIR)],
+                vec![(run_quadlet.as_str(), File::Symlink("/dev/null"))],
+                Some("non-bootc quadlet override"),
+            ),
+            (
+                "an /etc quadlet shadowing the vendor one",
+                vec![change(ChangeKind::Updated, VENDOR_QUADLET_DIR)],
+                vec![(etc_quadlet.as_str(), File::Regular("[Container]\n"))],
+                Some("a reboot is required"),
+            ),
+            (
+                "someone else's override of the same name in a subdirectory",
+                vec![change(ChangeKind::Updated, VENDOR_QUADLET_DIR)],
+                vec![(
+                    "run/containers/systemd/sub/foo.container",
+                    File::Regular("[Container]\n"),
+                )],
+                Some("non-bootc quadlet override"),
+            ),
+            (
+                "an /etc quadlet of the same name in a subdirectory",
+                vec![change(ChangeKind::Updated, VENDOR_QUADLET_DIR)],
+                vec![(
+                    "etc/containers/systemd/sub/foo.container",
+                    File::Regular("[Container]\n"),
+                )],
+                Some("a reboot is required"),
+            ),
+            (
+                "unrelated quadlets in /etc and /run",
+                vec![change(ChangeKind::Updated, VENDOR_QUADLET_DIR)],
+                vec![
+                    (
+                        "etc/containers/systemd/bar.container",
+                        File::Regular("[Container]\n"),
+                    ),
+                    (
+                        "run/containers/systemd/bar.container",
+                        File::Regular("[Container]\n"),
+                    ),
+                ],
+                None,
+            ),
+            (
+                "an /etc quadlet shadowing a removed vendor one",
+                vec![change(ChangeKind::Removed, VENDOR_QUADLET_DIR)],
+                vec![(etc_quadlet.as_str(), File::Regular("[Container]\n"))],
+                Some("a reboot is required"),
+            ),
+            (
+                "an /etc mask shadowing the vendor one",
+                vec![change(ChangeKind::Added, VENDOR_QUADLET_DIR)],
+                vec![(etc_quadlet.as_str(), File::Symlink("/dev/null"))],
+                Some("a reboot is required"),
+            ),
+            (
+                "the bound definition moving from /etc to the vendor directory",
+                vec![
+                    change(ChangeKind::Added, VENDOR_QUADLET_DIR),
+                    change(ChangeKind::Removed, ETC_QUADLET_DIR),
+                ],
+                vec![(etc_quadlet.as_str(), File::Regular("[Container]\n"))],
+                None,
+            ),
+            (
+                "the bound definition itself in /etc",
+                vec![change(ChangeKind::Updated, ETC_QUADLET_DIR)],
+                vec![(etc_quadlet.as_str(), File::Regular("[Container]\n"))],
+                None,
+            ),
+        ];
+        for (name, changes, files, expected) in cases {
+            let rootfs = &tempdir()?;
+            rootfs.create_dir_all(QUADLET_RUN_DIR)?;
+            rootfs.create_dir_all(ETC_QUADLET_DIR)?;
+            for (path, file) in files {
+                if let Some(parent) = Utf8Path::new(path).parent() {
+                    rootfs.create_dir_all(parent)?;
+                }
+                match file {
+                    File::Owned => rootfs.write(path, &owned)?,
+                    File::Regular(contents) => rootfs.write(path, contents)?,
+                    File::Symlink(target) => rootfs.symlink_contents(target, path)?,
+                }
+            }
+            let live = scan_live_quadlets(rootfs)?;
+            let live_by_path: BTreeMap<&Utf8Path, &LiveQuadlet> =
+                live.iter().map(|q| (q.relpath.as_path(), q)).collect();
+            let r = check_destinations(rootfs, &changes, &live_by_path);
+            match expected {
+                None => r.unwrap_or_else(|e| panic!("{name}: {e:#}")),
+                Some(msg) => {
+                    let e = format!("{:#}", r.unwrap_err());
+                    assert!(e.contains(msg), "{name}: {e}");
+                }
+            }
+        }
         Ok(())
     }
 

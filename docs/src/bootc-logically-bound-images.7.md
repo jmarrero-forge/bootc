@@ -83,7 +83,11 @@ still pending, as does re-running after a failed stop or restart.
 If the staged deployment contains any other change, the command fails and
 lists the out-of-scope paths; a reboot is required to apply it. Note that a
 locally modified quadlet in `/etc/containers/systemd` that also changed in
-the image is reported this way, since the local copy wins in `/etc`.
+the image is reported this way, since the local copy wins in `/etc`. For the
+same reason, a changed bound quadlet in `/usr/share/containers/systemd` that
+a quadlet of the same name in `/etc/containers/systemd` overrides is refused,
+as is a change that would replace or remove a quadlet in
+`/run/containers/systemd/` that bootc did not write.
 
 Because `/run` is transient, the override disappears on the next boot, at
 which point the staged deployment's own content applies. (A soft reboot
