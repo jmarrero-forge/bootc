@@ -35,7 +35,10 @@
 //! list, so a failure part way through -- including a failed stop -- is
 //! safe to resume from. Garbage-collection protection for bound images
 //! with no quadlet override (unchanged definitions) lives in the same
-//! directory; see [`write_protected_images`].
+//! directory; see [`write_protected_images`]. Once every definition is
+//! written, the staged checksum is recorded there too (see
+//! [`APPLIED_CHECKSUM`]); only then may a re-run skip straight to the
+//! pending unit operations.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -66,6 +69,12 @@ const PROTECTED_IMAGES_LIST: &str = "bootc/apply-live/protected-images.list";
 /// [`marker_line`]. Cleared entry-by-entry only after each `systemctl stop`
 /// succeeds, so `--no-restart` and failed stops remain retryable.
 const PENDING_STOPS_LIST: &str = "bootc/apply-live/pending-stops.list";
+/// The staged checksum (relative to `/run`) whose definitions have all been
+/// written to [`QUADLET_RUN_DIR`] and whose unit operations are recorded.
+/// Removals and pull-only definitions leave nothing in [`QUADLET_RUN_DIR`],
+/// so this is the only proof that an apply of that checksum got that far.
+/// Removed before a new apply changes anything.
+const APPLIED_CHECKSUM: &str = "bootc/apply-live/applied-checksum";
 /// Prefix of the leading marker comment line bootc writes at the top of
 /// each quadlet file it materializes under [`QUADLET_RUN_DIR`]; see
 /// [`marker_line`] and [`parse_marker`].
@@ -544,9 +553,8 @@ pub(crate) fn clear_state_from_host() -> Result<()> {
     }
     let run =
         Dir::open_ambient_dir("/run", cap_std::ambient_authority()).context("Opening /run")?;
-    let had_protected = run.remove_file_optional(PROTECTED_IMAGES_LIST)?;
-    let had_stops = run.remove_file_optional(PENDING_STOPS_LIST)?;
-    if live.is_empty() && !had_protected && !had_stops {
+    let had_state = run.remove_all_optional(STATE_DIR)?;
+    if live.is_empty() && !had_state {
         return Ok(());
     }
     println!("Cleared live-applied bound image definitions");
@@ -678,6 +686,36 @@ fn materialization_complete(
     Ok(true)
 }
 
+/// True if a previous run already wrote every definition of `staged_csum`
+/// (see [`APPLIED_CHECKSUM`]) and nothing has changed in `/run` since, so
+/// all that may be left is carrying out the recorded unit operations.
+/// Without the record, a removal-only or pull-only change set would look
+/// complete before anything was done, as none of it leaves an override.
+fn already_materialized(
+    run: &Dir,
+    rootfs: &Dir,
+    staged_csum: &str,
+    changes: &[QuadletChange],
+    live_by_path: &BTreeMap<&Utf8Path, &LiveQuadlet>,
+) -> Result<bool> {
+    let applied = run
+        .read_to_string_optional(APPLIED_CHECKSUM)
+        .with_context(|| format!("Reading /run/{APPLIED_CHECKSUM}"))?;
+    if applied.as_deref().map(str::trim) != Some(staged_csum) {
+        return Ok(false);
+    }
+    // Every live override must belong to this change set; anything else
+    // is stale and still needs reverting.
+    let current: BTreeSet<&Utf8Path> = changes
+        .iter()
+        .filter_map(|c| c.quadlet.as_deref())
+        .collect();
+    if live_by_path.keys().any(|p| !current.contains(p)) {
+        return Ok(false);
+    }
+    materialization_complete(changes, live_by_path, staged_csum, rootfs)
+}
+
 /// Refuse to clobber a `/run` quadlet bootc didn't write. Runs before any
 /// pull or write so a conflict can't leave a half-applied `/run` state.
 fn check_run_destinations(
@@ -747,24 +785,16 @@ pub(crate) async fn apply_bound_images(
         .collect();
 
     let pending_stops = collect_pending_stops(run, &live)?;
-    let materialize_done = stale.is_empty()
-        && materialization_complete(&changes, &live_by_path, staged_csum.as_str(), rootfs)?;
 
-    // Fast path: definitions are already on disk for this staged checksum.
-    // All that may be left is stopping units (after `--no-restart` or a
-    // failed stop) and/or restarting pending ones. Derived from
-    // `compute_changes` so unchanged bound quadlets (which never get a
-    // `/run` override) don't block it, and an empty change set with
-    // nothing pending doesn't spuriously report "already applied".
-    if materialize_done {
+    // Fast path: a previous run already wrote every definition for this
+    // staged checksum (it passed the scope check then). All that may be
+    // left is stopping units (after `--no-restart` or a failed stop)
+    // and/or restarting pending ones.
+    if already_materialized(run, rootfs, &staged_csum, &changes, &live_by_path)? {
         let pending_restarts: Vec<&LiveQuadlet> = live
             .iter()
             .filter(|q| q.pending && q.checksum == staged_csum)
             .collect();
-        if changes.is_empty() && pending_stops.is_empty() && pending_restarts.is_empty() {
-            println!("No bound image changes to apply");
-            return Ok(());
-        }
         if pending_stops.is_empty() && pending_restarts.is_empty() {
             println!("Bound images from staged deployment are already applied");
             return Ok(());
@@ -813,6 +843,10 @@ pub(crate) async fn apply_bound_images(
     // Ownership before any pull/write: a conflict must not leave a
     // half-applied `/run` state that an unrelated daemon-reload could pick up.
     check_run_destinations(rootfs, &changes, &live_by_path)?;
+
+    // From here on `/run` changes, so until this apply is complete a re-run
+    // must take the full path again.
+    run.remove_file_optional(APPLIED_CHECKSUM)?;
 
     tracing::info!(
         message_id = APPLY_LIVE_JOURNAL_ID,
@@ -911,6 +945,8 @@ pub(crate) async fn apply_bound_images(
     // Persist stops before attempting them so `--no-restart` and a failed
     // `systemctl stop` remain retryable on the next run.
     write_pending_stops(run, &stops)?;
+    run.atomic_write(APPLIED_CHECKSUM, staged_csum.as_bytes())
+        .with_context(|| format!("Writing /run/{APPLIED_CHECKSUM}"))?;
 
     if opts.no_restart {
         println!(
@@ -1371,6 +1407,74 @@ mod tests {
             &live_by_path,
             "other",
             rootfs
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_already_materialized() -> Result<()> {
+        let rootfs = &tempdir()?;
+        let run = &tempdir()?;
+        rootfs.create_dir_all(QUADLET_RUN_DIR)?;
+        run.create_dir_all(STATE_DIR)?;
+        const Q: &str = "usr/share/containers/systemd";
+        let gone = "[Container]\nImage=quay.io/foo/gone:latest\n";
+        let removed = QuadletChange {
+            kind: ChangeKind::Removed,
+            spec: spec(
+                &format!("{Q}/gone.container"),
+                "quay.io/foo/gone:latest",
+                gone,
+            ),
+            quadlet: Some("gone.container".into()),
+            unit: Some("gone.service".into()),
+            old_unit: None,
+        };
+        let pull_only = QuadletChange {
+            kind: ChangeKind::Added,
+            spec: spec("usr/lib/misc/new.container", "quay.io/foo/new:latest", gone),
+            quadlet: None,
+            unit: None,
+            old_unit: None,
+        };
+        let no_live = BTreeMap::new();
+        // Neither a removal nor a pull-only change leaves anything in /run,
+        // so without the record they must not look applied...
+        for changes in [vec![removed], vec![pull_only], vec![]] {
+            assert!(!already_materialized(
+                run, rootfs, "abc123", &changes, &no_live
+            )?);
+            // ...until a run records this checksum, and only this one
+            run.write(APPLIED_CHECKSUM, "abc123")?;
+            assert!(already_materialized(
+                run, rootfs, "abc123", &changes, &no_live
+            )?);
+            assert!(!already_materialized(
+                run, rootfs, "other", &changes, &no_live
+            )?);
+            run.remove_file(APPLIED_CHECKSUM)?;
+        }
+
+        // A live override outside the change set is stale, so not applied
+        // even with the record.
+        let body = "[Container]\nImage=quay.io/foo/foo:v2\n";
+        rootfs.write(
+            format!("{QUADLET_RUN_DIR}/foo.container"),
+            format!(
+                "{}{body}",
+                marker_line("abc123", false, "quay.io/foo/foo:v2", None)
+            ),
+        )?;
+        let live = scan_live_quadlets(rootfs)?;
+        let live_by_path: BTreeMap<&Utf8Path, &LiveQuadlet> =
+            live.iter().map(|q| (q.relpath.as_path(), q)).collect();
+        run.write(APPLIED_CHECKSUM, "abc123")?;
+        assert!(!already_materialized(
+            run,
+            rootfs,
+            "abc123",
+            &[],
+            &live_by_path
         )?);
         Ok(())
     }
