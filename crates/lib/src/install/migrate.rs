@@ -83,32 +83,87 @@ use cap_std_ext::cmdext::{CapStdExtCommandExt, CmdFds};
 #[cfg(test)]
 use fn_error_context::context;
 
+/// Paths below `/var` which `--preserve-var` never copies.
+const ALWAYS_EXCLUDED: &[&str] = &["tmp", "cache", "log/journal", "lib/containers"];
+
+/// What `--preserve-var` will copy, resolved before the install touches the
+/// target so that a problem with the source `/var` fails while the host can
+/// still boot its old system.
+#[derive(Debug)]
+pub(crate) struct VarMigrationPlan {
+    /// Canonical path of the running system's `/var`.
+    src_var: PathBuf,
+    /// Mounts below `src_var`, relative to it, which get empty placeholders.
+    nested_mounts: BTreeSet<PathBuf>,
+    /// The built-in and requested exclusions, relative to `src_var`.
+    exclusions: Vec<String>,
+}
+
+impl VarMigrationPlan {
+    /// `src_var` is the running system's `/var` (at `<root_path>/var`) and
+    /// `exclusions` the validated `--preserve-var-skip` paths.
+    pub(crate) fn prepare(src_var: &Path, exclusions: &[String]) -> Result<Self> {
+        // Resolve symlink aliases and path components before comparing against
+        // the absolute, kernel-resolved mountpoints in mountinfo.
+        let canonical_src_var = std::fs::canonicalize(src_var)
+            .with_context(|| format!("Canonicalizing source /var {}", src_var.display()))?;
+        // Check the source can be opened and read now rather than after install.
+        CapStdDir::open_ambient_dir(&canonical_src_var, ambient_authority())
+            .and_then(|dir| dir.entries().map(drop))
+            .with_context(|| format!("Opening source {}", canonical_src_var.display()))?;
+        let nested_mounts = mountinfo::nested_mountpoints_for(&canonical_src_var)?;
+        let exclusions = ALWAYS_EXCLUDED
+            .iter()
+            .map(|path| path.to_string())
+            .chain(exclusions.iter().cloned())
+            .collect::<Vec<_>>();
+        // Only directories and regular files can get a placeholder.
+        for mount in &nested_mounts {
+            // The copy never reaches mounts below an exclusion or below
+            // another nested mount.
+            let unreached = exclusions
+                .iter()
+                .any(|excluded| mount.starts_with(excluded))
+                || nested_mounts
+                    .iter()
+                    .any(|other| other != mount && mount.starts_with(other));
+            if unreached {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(canonical_src_var.join(mount))
+                .with_context(|| format!("Inspecting mountpoint /var/{}", mount.display()))?;
+            anyhow::ensure!(
+                metadata.is_dir() || metadata.is_file(),
+                "/var/{} is a mountpoint that is neither a directory nor a file; \
+                 exclude it with --preserve-var-skip",
+                mount.display()
+            );
+        }
+        Ok(Self {
+            src_var: canonical_src_var,
+            nested_mounts,
+            exclusions,
+        })
+    }
+}
+
 /// Preserve the running `/var` into the new deployment's `var/` directory.
 ///
-/// `src_var` is the running system's `/var` (at `<root_path>/var`).
-/// `new_var` is the new deployment's empty `var/` directory.
-pub(crate) fn preserve_var(src_var: &Path, new_var: &Path, exclusions: &[String]) -> Result<()> {
-    // Resolve symlink aliases and path components before comparing against the
-    // absolute, kernel-resolved mountpoints in mountinfo.
-    let canonical_src_var = std::fs::canonicalize(src_var)
-        .with_context(|| format!("Canonicalizing source /var {}", src_var.display()))?;
-    let nested_mounts = mountinfo::nested_mountpoints_for(&canonical_src_var)?;
-    let src_var = CapStdDir::open_ambient_dir(&canonical_src_var, ambient_authority())
-        .with_context(|| format!("Opening source {}", canonical_src_var.display()))?;
+/// `new_var` is the new deployment's `var/` directory, which ostree may
+/// already have seeded from the image's `/var`.
+pub(crate) fn preserve_var(plan: &VarMigrationPlan, new_var: &Path) -> Result<()> {
+    let src_var = CapStdDir::open_ambient_dir(&plan.src_var, ambient_authority())
+        .with_context(|| format!("Opening source {}", plan.src_var.display()))?;
     let new_var = open_or_create_var_dir(new_var)?;
-
-    let mut effective_exclusions = ["tmp", "cache", "log/journal", "lib/containers"]
-        .into_iter()
-        .map(String::from)
-        .collect::<Vec<_>>();
-    effective_exclusions.extend(exclusions.iter().cloned());
+    let effective_exclusions = &plan.exclusions;
+    let nested_mounts = &plan.nested_mounts;
 
     let copy_result = if supports_reflink(&src_var, &new_var)? {
         println!("  Filesystem supports reflinks — using copy-on-write clone (Strategy C)");
-        preserve_var_reflink_mounts(&src_var, &new_var, &effective_exclusions, &nested_mounts)
+        preserve_var_reflink_mounts(&src_var, &new_var, effective_exclusions, nested_mounts)
     } else {
         println!("  Filesystem does not support reflinks — falling back to full copy (Strategy D)");
-        preserve_var_copy_mounts(&src_var, &new_var, &effective_exclusions, &nested_mounts)
+        preserve_var_copy_mounts(&src_var, &new_var, effective_exclusions, nested_mounts)
     };
     copy_result?;
 
@@ -629,41 +684,47 @@ fn create_staged_placeholder(
     with_staging_dir(dst_parent, |_, staging| {
         create_mountpoint_placeholder(src_parent, staging, name)?;
         if !publish_staged_entry(staging, dst_parent, name, relative)? {
-            validate_empty_placeholder(dst_parent, name, src_parent.symlink_metadata(name)?)?;
+            validate_existing_placeholder(
+                dst_parent,
+                name,
+                relative,
+                src_parent.symlink_metadata(name)?,
+            )?;
         }
         Ok(())
     })
 }
 
-fn validate_empty_placeholder(
+/// The destination already has an entry where a nested mount's placeholder
+/// goes, typically because ostree seeded the new stateroot's `/var` from the
+/// image (e.g. `/var/log` in an image that ran dnf). Keep it: the mount covers
+/// it at boot. Only an entry of a different type can't serve as a mountpoint.
+fn validate_existing_placeholder(
     destination_parent: &CapStdDir,
     name: &OsStr,
+    relative: &Path,
     source_metadata: Metadata,
 ) -> Result<()> {
     let destination_metadata = destination_parent.symlink_metadata(name)?;
-    if source_metadata.is_dir() {
-        anyhow::ensure!(
-            destination_metadata.is_dir(),
-            "Mountpoint placeholder {} exists with the wrong type",
-            name.to_string_lossy()
-        );
-        let destination = open_child_dir_nofollow(destination_parent, name)?;
-        let mut entries = destination.read_dir(".")?;
-        anyhow::ensure!(
-            entries.next().transpose()?.is_none(),
-            "Mountpoint placeholder {} is not empty",
-            name.to_string_lossy()
-        );
+    let same_type = (source_metadata.is_dir() && destination_metadata.is_dir())
+        || (source_metadata.is_file() && destination_metadata.is_file());
+    anyhow::ensure!(
+        same_type,
+        "Mountpoint placeholder /var/{} already exists in the new deployment with a different type",
+        relative.display()
+    );
+    let has_content = if destination_metadata.is_dir() {
+        open_child_dir_nofollow(destination_parent, name)?
+            .entries()?
+            .next()
+            .is_some()
     } else {
-        anyhow::ensure!(
-            source_metadata.is_file() && destination_metadata.is_file(),
-            "Mountpoint placeholder {} exists with the wrong type",
-            name.to_string_lossy()
-        );
-        anyhow::ensure!(
-            destination_metadata.len() == 0,
-            "Mountpoint placeholder {} is not empty",
-            name.to_string_lossy()
+        destination_metadata.len() > 0
+    };
+    if has_content {
+        println!(
+            "    Keeping the image's content at mountpoint /var/{}; the mount hides it at boot",
+            relative.display()
         );
     }
     Ok(())
@@ -828,8 +889,12 @@ fn preserve_metadata<Fd: AsFd>(
     preserve_metadata_timestamps(metadata, &dst_fd)
 }
 
+const SELINUX_XATTR: &str = "security.selinux";
+
 /// Make the destination xattr set exactly match the source snapshot. Removing
 /// extras first matters for inherited ACLs and labels as well as user xattrs.
+/// The one exception: a source without `security.selinux` keeps the
+/// destination's label.
 fn apply_xattrs_exact<Fd: AsFd>(
     destination: Fd,
     source_xattrs: &[(std::ffi::OsString, Vec<u8>)],
@@ -843,7 +908,10 @@ fn apply_xattrs_exact<Fd: AsFd>(
         .map(|(name, _)| name.as_os_str())
         .collect::<BTreeSet<_>>();
     for name in destination_names {
-        if !source_names.contains(name.as_os_str()) {
+        // A source without an SELinux label (the root of a tmpfs mount, on
+        // some kernels) leaves the destination the label policy gave it:
+        // SELinux doesn't allow removing it, and unlabeled would be worse.
+        if !source_names.contains(name.as_os_str()) && name != SELINUX_XATTR {
             fremovexattr(&destination, &name).with_context(|| {
                 format!("Removing destination xattr {}", name.to_string_lossy())
             })?;
@@ -1072,6 +1140,26 @@ mod tests {
         )
         .unwrap();
         CapStdDir::from_std_file(std::fs::File::from(fd))
+    }
+
+    #[test]
+    fn migration_plan_is_checked_before_install() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let src_var = temp.path().join("var");
+        fs::create_dir(&src_var)?;
+        let plan = VarMigrationPlan::prepare(&src_var, &["lib/pgsql".to_string()])?;
+        assert_eq!(plan.src_var, fs::canonicalize(&src_var)?);
+        assert_eq!(
+            plan.exclusions,
+            ["tmp", "cache", "log/journal", "lib/containers", "lib/pgsql"]
+        );
+
+        let error = VarMigrationPlan::prepare(&temp.path().join("missing"), &[]).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Canonicalizing source /var"),
+            "{error:#}"
+        );
+        Ok(())
     }
 
     #[test]
@@ -1523,7 +1611,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_mountpoint_placeholders_are_retry_safe_and_type_checked() -> Result<()> {
+    fn mountpoint_placeholders_reuse_seeded_destinations_and_check_type() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let src_path = temp.path().join("src");
         fs::create_dir_all(src_path.join("directory-mount"))?;
@@ -1554,25 +1642,20 @@ mod tests {
             assert_eq!(fs::read_dir(dst_path.join("directory-mount"))?.count(), 0);
             assert_eq!(fs::metadata(dst_path.join("file-mount"))?.len(), 0);
 
+            // ostree seeds the new /var from the image, so a mountpoint can
+            // already have content there. It is kept untouched, and the mount
+            // hides it at boot.
             fs::write(dst_path.join("directory-mount/sentinel"), b"keep")?;
-            let error = if reflink {
-                preserve_var_reflink_mounts(&src, &dst, &[], &mounts)
+            fs::write(dst_path.join("file-mount"), b"keep file")?;
+            if reflink {
+                preserve_var_reflink_mounts(&src, &dst, &[], &mounts)?;
             } else {
-                preserve_var_copy_mounts(&src, &dst, &[], &mounts)
-            };
-            assert!(error.is_err());
+                preserve_var_copy_mounts(&src, &dst, &[], &mounts)?;
+            }
             assert_eq!(
                 fs::read(dst_path.join("directory-mount/sentinel"))?,
                 b"keep"
             );
-            fs::remove_file(dst_path.join("directory-mount/sentinel"))?;
-            fs::write(dst_path.join("file-mount"), b"keep file")?;
-            let error = if reflink {
-                preserve_var_reflink_mounts(&src, &dst, &[], &mounts)
-            } else {
-                preserve_var_copy_mounts(&src, &dst, &[], &mounts)
-            };
-            assert!(error.is_err());
             assert_eq!(fs::read(dst_path.join("file-mount"))?, b"keep file");
 
             let wrong_type = temp.path().join(format!("wrong-type-{strategy}"));

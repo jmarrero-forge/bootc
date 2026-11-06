@@ -57,139 +57,68 @@ fn nested_mountpoints(
     Ok(nested)
 }
 
-/// Parse the byte-oriented Linux mountinfo format without requiring UTF-8.
-/// Kernel pathname escapes are decoded before paths are constructed.
+/// The mountpoint is the fifth space-separated field of a mountinfo record
+/// (see proc_pid_mountinfo(5)).
+const MOUNTINFO_MOUNTPOINT_FIELD: usize = 4;
+
+/// Extract the mountpoints from the byte-oriented Linux mountinfo format
+/// without requiring UTF-8.
+///
+/// Only the mountpoint is used, so the other fields are not validated: the
+/// snapshot covers the whole installer mount namespace, and a record this code
+/// has no interest in (e.g. a mount with an empty source, which the kernel
+/// prints as two consecutive spaces) must not fail the migration. The fields
+/// before the mountpoint are never empty, so splitting on single spaces finds
+/// it reliably.
 fn parse_mountinfo(data: &[u8]) -> Result<Vec<PathBuf>> {
-    let mut mountpoints = Vec::new();
-    let lines = data.split(|byte| *byte == b'\n');
-    let line_count = lines.clone().count();
-    for (index, line) in lines.enumerate() {
-        if line.is_empty() && index + 1 == line_count {
-            continue; // A final newline is conventional.
-        }
-        anyhow::ensure!(!line.is_empty(), "Empty mountinfo line {}", index + 1);
-        anyhow::ensure!(
-            !line.contains(&0),
-            "NUL byte in mountinfo line {}",
-            index + 1
-        );
-        let fields = line
-            .split(|byte| byte.is_ascii_whitespace())
-            .filter(|field| !field.is_empty())
-            .collect::<Vec<_>>();
-        let separator = fields
-            .iter()
-            .enumerate()
-            .skip(6)
-            .find_map(|(index, field)| (*field == b"-").then_some(index))
-            .with_context(|| {
-                format!("Malformed mountinfo line {}: missing separator", index + 1)
-            })?;
-        anyhow::ensure!(
-            separator >= 6 && fields.len() == separator + 4,
-            "Malformed mountinfo line {}: invalid field count",
-            index + 1
-        );
-        anyhow::ensure!(
-            is_positive_decimal(fields[0])
-                && is_decimal(fields[1])
-                && is_device_number(fields[2])
-                && !fields[5].is_empty()
-                && !fields[separator + 1].is_empty()
-                && !fields[separator + 2].is_empty()
-                && !fields[separator + 3].is_empty(),
-            "Malformed mountinfo line {}: invalid required field",
-            index + 1
-        );
-        // The root field is not used for mount selection. Decode it to ensure
-        // its escape syntax is valid, but don't impose pathname constraints:
-        // unlike the mountpoint, it may be relative or noncanonical.
-        decode_mountinfo_escapes(fields[3])
-            .with_context(|| format!("Malformed root path on mountinfo line {}", index + 1))?;
-        let mountpoint = decode_mountinfo_path(fields[4])
-            .with_context(|| format!("Malformed mountpoint on mountinfo line {}", index + 1))?;
-        decode_mountinfo_escapes(fields[separator + 2])
-            .with_context(|| format!("Malformed source path on mountinfo line {}", index + 1))?;
-        mountpoints.push(mountpoint);
-    }
+    let mountpoints = data
+        .split(|byte| *byte == b'\n')
+        .enumerate()
+        .filter(|(_, line)| !line.is_empty())
+        .map(|(index, line)| {
+            let field = line
+                .split(|byte| *byte == b' ')
+                .nth(MOUNTINFO_MOUNTPOINT_FIELD)
+                .with_context(|| {
+                    format!("Malformed mountinfo line {}: no mountpoint", index + 1)
+                })?;
+            Ok(PathBuf::from(std::ffi::OsString::from_vec(
+                decode_mountinfo_escapes(field),
+            )))
+        })
+        .collect::<Result<Vec<_>>>()?;
     anyhow::ensure!(!mountpoints.is_empty(), "Mountinfo contained no records");
     Ok(mountpoints)
 }
 
-fn is_decimal(value: &[u8]) -> bool {
-    !value.is_empty()
-        && value.iter().all(u8::is_ascii_digit)
-        && std::str::from_utf8(value)
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .is_some()
-}
-
-fn is_positive_decimal(value: &[u8]) -> bool {
-    is_decimal(value)
-        && std::str::from_utf8(value)
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .is_some_and(|value| value > 0)
-}
-
-fn is_device_number(value: &[u8]) -> bool {
-    let Some(separator) = value.iter().position(|byte| *byte == b':') else {
-        return false;
-    };
-    is_decimal(&value[..separator]) && is_decimal(&value[separator + 1..])
-}
-
-fn decode_mountinfo_path(value: &[u8]) -> Result<PathBuf> {
-    let decoded = decode_mountinfo_escapes(value)?;
-    anyhow::ensure!(
-        decoded.first() == Some(&b'/'),
-        "Mountinfo path is not absolute"
-    );
-    let mut components = decoded[1..].split(|byte| *byte == b'/');
-    anyhow::ensure!(
-        decoded.len() == 1
-            || components.all(|component| {
-                !component.is_empty() && component != b"." && component != b".."
-            }),
-        "Mountinfo path is not canonical"
-    );
-    Ok(PathBuf::from(std::ffi::OsString::from_vec(decoded)))
-}
-
-fn decode_mountinfo_escapes(value: &[u8]) -> Result<Vec<u8>> {
+/// Decode the kernel's `\ooo` octal escapes (it escapes space, tab, newline
+/// and backslash). Anything else is kept as is.
+fn decode_mountinfo_escapes(value: &[u8]) -> Vec<u8> {
     let mut decoded = Vec::with_capacity(value.len());
-    let mut index = 0;
-    while index < value.len() {
-        if value[index] != b'\\' {
-            decoded.push(value[index]);
-            index += 1;
-            continue;
-        }
-        anyhow::ensure!(
-            index + 3 < value.len()
-                && value[index + 1..index + 4]
+    let mut rest = value;
+    while let Some((&byte, tail)) = rest.split_first() {
+        let escaped = (byte == b'\\')
+            .then(|| tail.get(..3))
+            .flatten()
+            .filter(|digits| digits.iter().all(|digit| (b'0'..=b'7').contains(digit)))
+            .and_then(|digits| {
+                let value = digits
                     .iter()
-                    .all(|byte| (b'0'..=b'7').contains(byte)),
-            "Invalid octal escape in mountinfo path"
-        );
-        // Mountinfo escapes are three octal digits. Decode wider than a byte
-        // so malformed values such as `\777` cannot overflow or wrap.
-        let escaped = u16::from(value[index + 1] - b'0') * 64
-            + u16::from(value[index + 2] - b'0') * 8
-            + u16::from(value[index + 3] - b'0');
-        anyhow::ensure!(
-            escaped <= u16::from(u8::MAX),
-            "Octal escape exceeds one byte"
-        );
-        anyhow::ensure!(
-            matches!(escaped, 0o11 | 0o12 | 0o40 | 0o134),
-            "Unsupported octal escape in mountinfo path"
-        );
-        decoded.push(escaped as u8);
-        index += 4;
+                    .fold(0u16, |acc, digit| acc * 8 + u16::from(digit - b'0'));
+                u8::try_from(value).ok()
+            });
+        match escaped {
+            Some(escaped) => {
+                decoded.push(escaped);
+                rest = &tail[3..];
+            }
+            None => {
+                decoded.push(byte);
+                rest = tail;
+            }
+        }
     }
-    Ok(decoded)
+    decoded
 }
 
 #[cfg(test)]
@@ -277,19 +206,34 @@ mod tests {
     }
 
     #[test]
-    fn mountinfo_rejects_malformed_records_and_escapes() {
-        for mountinfo in [
-            b"".as_slice(),
-            b"not a mountinfo record\n",
-            b"36 25 0:32 /bad\\04x /target/var rw - tmpfs tmpfs rw\n",
-            b"36 25 0:32 / /target/var\\04x rw - tmpfs tmpfs rw\n",
-            b"36 25 0:32 / /target/var\\400 rw - tmpfs tmpfs rw\n",
-            b"36 25 0:32 / /target/var\\777 rw - tmpfs tmpfs rw\n",
-            b"36 25 0:32 / /target/var\\041 rw - tmpfs tmpfs rw\n",
-            b"36 25 0:32 / relative rw - tmpfs tmpfs rw\n",
-            b"36 25 0:32 / /target/var/../outside rw - tmpfs tmpfs rw\n",
-            b"36 25 0:32 / /target/var rw - tmpfs tmpfs rw extra\n",
-        ] {
+    fn mountinfo_accepts_records_it_does_not_use() -> Result<()> {
+        // Real records from a 6.12 kernel and podman: a tmpfs mounted with an
+        // empty source (two spaces before the options), optional fields, and
+        // escapes in fields other than the mountpoint.
+        let mountinfo = concat!(
+            "21 1 0:21 / / rw - overlay overlay rw\n",
+            "36 21 0:32 / /target/var rw shared:1 master:2 - xfs /dev/vda3 rw\n",
+            "37 36 0:33 / /target/var/lib/empty-src rw,relatime shared:3 - tmpfs  rw,inode64\n",
+            "38 21 0:34 /some\\134dir /unrelated\\040dir rw - fuse.x a\\040b rw\n",
+            "39 36 0:35 / /target/var/odd\\9name rw - tmpfs tmpfs rw\n",
+            "40 36 0:36 / /target/var/gone\\040(deleted) rw - tmpfs tmpfs rw\n",
+        );
+        let parsed = parse_mountinfo(mountinfo.as_bytes())?;
+        assert_eq!(parsed[3], PathBuf::from("/unrelated dir"));
+        assert_eq!(
+            nested_mountpoints(Path::new("/target/var"), parsed)?,
+            BTreeSet::from([
+                PathBuf::from("lib/empty-src"),
+                PathBuf::from("odd\\9name"),
+                PathBuf::from("gone (deleted)"),
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mountinfo_rejects_records_without_a_mountpoint() {
+        for mountinfo in [b"".as_slice(), b"\n", b"36 25 0:32 /\n"] {
             assert!(
                 parse_mountinfo(mountinfo).is_err(),
                 "accepted {mountinfo:?}"
