@@ -889,8 +889,12 @@ fn preserve_metadata<Fd: AsFd>(
     preserve_metadata_timestamps(metadata, &dst_fd)
 }
 
+const SELINUX_XATTR: &str = "security.selinux";
+
 /// Make the destination xattr set exactly match the source snapshot. Removing
 /// extras first matters for inherited ACLs and labels as well as user xattrs.
+/// The one exception: a source without `security.selinux` keeps the
+/// destination's label.
 fn apply_xattrs_exact<Fd: AsFd>(
     destination: Fd,
     source_xattrs: &[(std::ffi::OsString, Vec<u8>)],
@@ -904,7 +908,10 @@ fn apply_xattrs_exact<Fd: AsFd>(
         .map(|(name, _)| name.as_os_str())
         .collect::<BTreeSet<_>>();
     for name in destination_names {
-        if !source_names.contains(name.as_os_str()) {
+        // A source without an SELinux label (the root of a tmpfs mount, on
+        // some kernels) leaves the destination the label policy gave it:
+        // SELinux doesn't allow removing it, and unlabeled would be worse.
+        if !source_names.contains(name.as_os_str()) && name != SELINUX_XATTR {
             fremovexattr(&destination, &name).with_context(|| {
                 format!("Removing destination xattr {}", name.to_string_lossy())
             })?;
