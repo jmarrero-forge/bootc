@@ -19,8 +19,9 @@ Run `bootc image copy-to-storage --help` for more options.
 
 `bootc image mount` exposes a path from the locally available booted or staged
 deployment image at an existing empty directory. The source must be a directory;
-`--source /` selects the image root. It refuses target paths with symlink
-components and targets that are already mountpoints. It does not pull an image
+`--source /` selects the image root. Symlinks in the target path are resolved
+(on bootc systems `/mnt` is usually a symlink to `/var/mnt`), and targets that
+are already mountpoints are refused. It does not pull an image
 or merge deployment state: `/var` is never mounted from host state. On an
 OSTree deployment that does not use composefs, `/etc` holds the deployment's
 merged configuration rather than image content, so `--source /` and sources at

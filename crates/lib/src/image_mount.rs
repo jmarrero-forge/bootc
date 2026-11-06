@@ -368,7 +368,7 @@ fn source_relative_path(source: &Utf8Path) -> Result<Utf8PathBuf> {
 }
 
 pub(crate) fn unmount(opts: UnmountOpts) -> Result<()> {
-    let (target, parent) = open_path_no_symlinks(&opts.target, false)?;
+    let (resolved, target, parent) = open_target(&opts.target, false)?;
     ensure_not_root_target(&target, &opts.target)?;
     let parent = parent.context("Refusing to unmount the root filesystem")?;
     ensure!(
@@ -381,8 +381,7 @@ pub(crate) fn unmount(opts: UnmountOpts) -> Result<()> {
     // unmount by name relative to the retained parent instead, so the path
     // is still resolved from the directory validated above.
     drop(target);
-    let name = opts
-        .target
+    let name = resolved
         .file_name()
         .context("Mount target has no final path component")?;
     let fd_path = format!("/proc/self/fd/{}/{name}", parent.as_raw_fd());
@@ -392,7 +391,22 @@ pub(crate) fn unmount(opts: UnmountOpts) -> Result<()> {
 }
 
 fn open_mount_target(path: &Utf8Path) -> Result<(std::fs::File, Option<std::fs::File>)> {
-    open_path_no_symlinks(path, true)
+    open_target(path, true).map(|(_, target, parent)| (target, parent))
+}
+
+/// Resolve symlinks in a caller-supplied target first: bootc systems commonly
+/// have some, such as /mnt -> var/mnt or /home -> var/home. The result is then
+/// opened without following any, so a concurrent change to the path fails
+/// rather than redirecting the operation.
+fn open_target(
+    path: &Utf8Path,
+    final_directory: bool,
+) -> Result<(Utf8PathBuf, std::fs::File, Option<std::fs::File>)> {
+    let resolved = path
+        .canonicalize_utf8()
+        .with_context(|| format!("Resolving target {path}"))?;
+    let (target, parent) = open_path_no_symlinks(&resolved, final_directory)?;
+    Ok((resolved, target, parent))
 }
 
 /// Resolve an absolute path one component at a time, retaining the parent
@@ -509,17 +523,17 @@ fn ensure_not_root_target(target: &std::fs::File, path: &Utf8Path) -> Result<()>
 mod tests {
     use super::{
         Deployment, MountOpts, UnmountOpts, ensure_directory_empty, ensure_not_mountpoint,
-        ensure_not_root_target, open_mount_target, open_path_no_symlinks, open_source,
+        ensure_not_root_target, open_mount_target, open_path_no_symlinks, open_source, open_target,
         source_relative_path,
     };
     use crate::cli::{ImageOpts, InstallOpts, Opt};
     use camino::{Utf8Path, Utf8PathBuf};
     use cap_std_ext::cap_std::ambient_authority;
     use clap::Parser;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{MetadataExt, symlink};
 
     fn open_existing_path(path: &Utf8Path) -> anyhow::Result<std::fs::File> {
-        open_path_no_symlinks(path, false).map(|(target, _)| target)
+        open_target(path, false).map(|(_, target, _)| target)
     }
 
     #[test]
@@ -592,7 +606,8 @@ mod tests {
         let root_alias = temp.path().join("root-alias");
         symlink("/", &root_alias).unwrap();
         let root_alias = Utf8PathBuf::from_path_buf(root_alias).unwrap();
-        assert!(open_existing_path(&root_alias).is_err());
+        let root_alias_fd = open_existing_path(&root_alias).unwrap();
+        assert!(ensure_not_root_target(&root_alias_fd, &root_alias).is_err());
     }
 
     #[test]
@@ -663,7 +678,7 @@ mod tests {
     }
 
     #[test]
-    fn mount_target_must_be_empty_and_have_no_symlink_components() {
+    fn mount_target_must_be_empty_and_symlinks_resolve_to_it() {
         let temp = tempfile::tempdir().unwrap();
         let target_path = Utf8PathBuf::from_path_buf(temp.path().join("empty")).unwrap();
         std::fs::create_dir(&target_path).unwrap();
@@ -677,12 +692,19 @@ mod tests {
         let linked_target = temp.path().join("linked-target");
         symlink(&target_path, &linked_target).unwrap();
         let linked_target = Utf8PathBuf::from_path_buf(linked_target).unwrap();
-        assert!(open_mount_target(&linked_target).is_err());
-
         let linked_parent = temp.path().join("linked-parent");
         symlink(temp.path(), &linked_parent).unwrap();
         let nested_target = Utf8PathBuf::from_path_buf(linked_parent.join("empty")).unwrap();
-        assert!(open_mount_target(&nested_target).is_err());
+        let target_ino = target.metadata().unwrap().ino();
+        for path in [&linked_target, &nested_target] {
+            let (resolved, _) = open_mount_target(path).unwrap();
+            assert_eq!(resolved.metadata().unwrap().ino(), target_ino, "{path}");
+        }
+
+        // Without resolution first, symlinks in the path are refused.
+        assert!(open_path_no_symlinks(&linked_target, true).is_err());
+        assert!(open_path_no_symlinks(&nested_target, true).is_err());
+        assert!(open_mount_target(&target_path.join("missing")).is_err());
     }
 
     #[test]
