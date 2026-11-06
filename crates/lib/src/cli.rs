@@ -348,8 +348,8 @@ pub(crate) enum InstallOpts {
     /// need to be cleaned up if desired when rebooted into the new root.
     ///
     /// When migrating from a package-mode system, use `--preserve-var` to copy `/var` data
-    /// into the new deployment and write a GRUB rollback entry, and `--merge-etc` to carry
-    /// forward `/etc` customisations via a 3-way merge.
+    /// into the new deployment, and `--merge-etc` to carry forward the host's `/etc`
+    /// customisations.
     ToExistingRoot(crate::install::InstallToExistingRootOpts),
     /// Nondestructively create a fresh installation state inside an existing bootc system.
     ///
