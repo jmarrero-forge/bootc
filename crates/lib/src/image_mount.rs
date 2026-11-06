@@ -52,8 +52,8 @@ struct MountedImageRoot {
     tree: OwnedFd,
     // Keep the repository/sysroot locked while cloning and attaching its tree.
     _storage: StorageGuard,
-    // A non-composefs OSTree checkout has deployment-local /etc. Replace it
-    // with pristine image content from /usr/etc before exposing the tree.
+    // A non-composefs OSTree checkout, whose /etc is deployment-local state
+    // rather than image content.
     checkout: bool,
 }
 
@@ -91,7 +91,7 @@ pub(crate) async fn mount(opts: MountOpts) -> Result<()> {
     } = image;
 
     if checkout {
-        mount_pristine_etc(&tree)?;
+        ensure_source_outside_checkout_etc(&opts.source)?;
     }
     bootc_initramfs_setup::set_mount_tree_readonly(&tree)
         .context("Making selected deployment image read-only")?;
@@ -274,25 +274,21 @@ async fn mount_ostree_image(opts: &MountOpts) -> Result<MountedImageRoot> {
     })
 }
 
-fn mount_pristine_etc(tree: &impl AsFd) -> Result<()> {
-    let root = Dir::reopen_dir(tree).context("Opening selected OSTree checkout")?;
-    let usr_etc = root
-        .open_dir("usr/etc")
-        .context("Opening pristine image /usr/etc")?;
-    let etc_tree = open_tree(
-        &usr_etc,
-        ".",
-        OpenTreeFlags::OPEN_TREE_CLONE | OpenTreeFlags::OPEN_TREE_CLOEXEC,
-    )
-    .context("Cloning pristine image /usr/etc")?;
-    move_mount(
-        &etc_tree,
-        "",
-        &root,
-        "etc",
-        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
-    )
-    .context("Replacing deployment-local /etc with pristine image /usr/etc")
+/// Refuse sources that would expose an OSTree checkout's /etc, which holds the
+/// deployment's merged configuration rather than image content. The image's
+/// default configuration remains available at `/usr/etc`.
+fn ensure_source_outside_checkout_etc(source: &Utf8Path) -> Result<()> {
+    let relative = source_relative_path(source)?;
+    let first = relative.components().find_map(|component| match component {
+        camino::Utf8Component::Normal(component) => Some(component),
+        _ => None,
+    });
+    ensure!(
+        !matches!(first, None | Some("etc")),
+        "image source {source} would expose the deployment's /etc in an OSTree deployment \
+         without composefs; select a path outside /etc (image defaults are in /usr/etc)"
+    );
+    Ok(())
 }
 
 fn open_source(root: &Dir, source: &Utf8Path) -> Result<std::fs::File> {
@@ -607,6 +603,26 @@ mod tests {
             format!("{err:#}").contains("is not a mountpoint"),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn checkout_sources_must_not_include_deployment_etc() {
+        for (source, allowed) in [
+            ("/", false),
+            ("/etc", false),
+            ("/etc/ostree", false),
+            ("/./etc", false),
+            ("/usr", true),
+            ("/usr/etc", true),
+            ("/opt/etc", true),
+            ("/etcetera", true),
+        ] {
+            assert_eq!(
+                super::ensure_source_outside_checkout_etc(Utf8Path::new(source)).is_ok(),
+                allowed,
+                "{source}"
+            );
+        }
     }
 
     #[test]

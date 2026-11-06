@@ -21,9 +21,11 @@ Run `bootc image copy-to-storage --help` for more options.
 deployment image at an existing empty directory. The source must be a directory;
 `--source /` selects the image root. It refuses target paths with symlink
 components and targets that are already mountpoints. It does not pull an image
-or merge deployment state: `/var` is never mounted from host state, and OSTree
-checkout fallbacks use the image's pristine `/usr/etc` rather than deployment-local
-`/etc`. The target is checked immediately before attachment; callers must prevent
+or merge deployment state: `/var` is never mounted from host state. On an
+OSTree deployment that does not use composefs, `/etc` holds the deployment's
+merged configuration rather than image content, so `--source /` and sources at
+or below `/etc` are refused there; the image defaults are in `/usr/etc`. The
+target is checked immediately before attachment; callers must prevent
 concurrent changes to the target directory while the command runs.
 
 ```sh
