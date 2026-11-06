@@ -96,6 +96,7 @@ use fn_error_context::context;
 
 use crate::store::reflink::supports_reflink;
 
+mod accounts;
 mod package_defaults;
 use package_defaults::PackageDefaults;
 
@@ -149,6 +150,7 @@ impl EtcMergePlan {
             &root_path.join("etc"),
             &image_etc,
             &scratch_etc,
+            Some(&image_root.join("usr/lib")),
             false,
         )
         .context("Checking the host's /etc merges into the image's; nothing was changed yet")?;
@@ -179,6 +181,7 @@ pub(crate) fn merge_etc_into_deployment(
         &host_etc,
         &deploy_usr_etc,
         &deploy_etc,
+        Some(&deploy_dir.join("usr/lib")),
         true,
     )
 }
@@ -1325,6 +1328,7 @@ fn merge_etc(
     host_etc: &Path,
     deploy_usr_etc: &Path,
     deploy_etc: &Path,
+    image_usr_lib: Option<&Path>,
     verbose: bool,
 ) -> Result<()> {
     let pristine_fd = CapStdDir::open_ambient_dir(deploy_usr_etc, ambient_authority())
@@ -1370,6 +1374,12 @@ fn merge_etc(
 
     merge(&current_fd, &current_tree, &new_fd, &new_tree, &diff)
         .context("Applying /etc 3-way merge")?;
+    let image_lib = image_usr_lib
+        .map(|path| CapStdDir::open_ambient_dir(path, ambient_authority()))
+        .transpose()
+        .context("Opening the image's /usr/lib")?;
+    accounts::add_image_accounts(&pristine_fd, image_lib.as_ref(), &new_fd, verbose)
+        .context("Adding the image's accounts")?;
 
     if verbose {
         println!("  /etc merge complete.");
@@ -1497,6 +1507,10 @@ mod tests {
                 &[
                     ("pam.d/login", "image pam"),
                     ("ssh/sshd_config", "image sshd"),
+                    (
+                        "passwd",
+                        "root:x:0:0::/root:/bin/bash\nimguser:x:950:950::/:/sbin/nologin\n",
+                    ),
                 ][..],
             ),
             (
@@ -1506,6 +1520,10 @@ mod tests {
                     ("pam.d/login", "old package pam"),
                     // Edited by the admin: the host wins.
                     ("ssh/sshd_config", "admin sshd"),
+                    (
+                        "passwd",
+                        "root:x:0:0::/root:/bin/bash\nbob:x:1000:1000::/home/bob:/bin/bash\n",
+                    ),
                     // A package default directory with an admin file in it.
                     ("hostpkg.d/default.conf", "host package default"),
                     ("hostpkg.d/local.conf", "admin file"),
@@ -1542,7 +1560,7 @@ mod tests {
             ]
             .map(PathBuf::from),
         );
-        merge_etc(&defaults, &host, &image, &new, false)?;
+        merge_etc(&defaults, &host, &image, &new, None, false)?;
 
         let read = |path: &str| fs::read_to_string(new.join(path));
         assert_eq!(read("pam.d/login")?, "image pam");
@@ -1553,6 +1571,11 @@ mod tests {
         assert_eq!(fs::metadata(new.join("pam.d"))?.mode() & 0o7777, 0o700);
         assert!(!new.join("hostpkg.d/default.conf").exists());
         assert!(!new.join("oldpkg").exists());
+        assert_eq!(
+            read("passwd")?,
+            "root:x:0:0::/root:/bin/bash\nbob:x:1000:1000::/home/bob:/bin/bash\n\
+             imguser:x:950:950::/:/sbin/nologin\n"
+        );
         Ok(())
     }
 
@@ -1572,7 +1595,15 @@ mod tests {
             host.join("selinux/config"),
             "SELINUX=enforcing\nSELINUXTYPE=mls\n",
         )?;
-        let error = merge_etc(&PackageDefaults::default(), &host, &image, &new, false).unwrap_err();
+        let error = merge_etc(
+            &PackageDefaults::default(),
+            &host,
+            &image,
+            &new,
+            None,
+            false,
+        )
+        .unwrap_err();
         assert!(
             format!("{error:#}").contains("mls SELinux policy"),
             "{error:#}"
@@ -1619,7 +1650,15 @@ mod tests {
         symlink("/etc/pki/tls/certs", host.join("ssl/certs"))?;
 
         // An admin-made symlink where the image has a directory conflicts.
-        let error = merge_etc(&PackageDefaults::default(), &host, &image, &new, false).unwrap_err();
+        let error = merge_etc(
+            &PackageDefaults::default(),
+            &host,
+            &image,
+            &new,
+            None,
+            false,
+        )
+        .unwrap_err();
         assert!(
             format!("{error:#}").contains("conflict with the image's /etc"),
             "{error:#}"
@@ -1628,7 +1667,7 @@ mod tests {
 
         // The same symlink as a package default is not a conflict.
         let defaults = PackageDefaults::from_paths([PathBuf::from("ssl/certs")]);
-        merge_etc(&defaults, &host, &image, &new, false)?;
+        merge_etc(&defaults, &host, &image, &new, None, false)?;
         assert!(new.join("ssl/certs").is_dir());
         assert_eq!(fs::read_to_string(new.join("admin.conf"))?, "admin");
         Ok(())

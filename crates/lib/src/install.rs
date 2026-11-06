@@ -661,7 +661,8 @@ pub(crate) struct InstallToExistingRootOpts {
     /// packages installed (edited package files, files no package owns, and
     /// machine-specific `%ghost` files such as `machine-id`) are copied into
     /// the new deployment's `/etc`. Entries that still match their package are
-    /// left to the image's version.
+    /// left to the image's version. The image's users and groups that the
+    /// host's account databases lack are added to them.
     ///
     /// The host's RPM database is required. Conflicts (for example a host
     /// file where the image has a directory) are reported before the

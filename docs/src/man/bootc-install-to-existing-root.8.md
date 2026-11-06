@@ -65,9 +65,10 @@ package owns, and machine-specific files packages mark as `%ghost` (such as
 `/etc/machine-id` and SSH host keys) are carried over, while files that still
 match their package are left to the image's version, as are generated caches and
 the compiled SELinux policy (SELinux customizations made with `semanage` or
-`setsebool -P` are not carried). The merge is checked against the image's `/etc`
-before anything is installed, so a conflict, such as a host file where the image
-has a directory, fails without changing the system.
+`setsebool -P` are not carried). Users and groups the image defines and the host
+lacks are added to the host's account databases. The merge is checked against
+the image's `/etc` before anything is installed, so a conflict, such as a host
+file where the image has a directory, fails without changing the system.
 
 ### Before reboot: Injecting new configuration
 

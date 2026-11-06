@@ -135,7 +135,8 @@ prepare:
       trap 'rm -rf -- "$workdir"' EXIT
       cat > "$workdir/Containerfile" <<'EOF'
       FROM localhost/bootc
-      RUN mkdir -p /etc/bootc-tmt-merge && \
+      RUN useradd --system --no-create-home bootc-tmt-image-user && \
+          mkdir -p /etc/bootc-tmt-merge && \
           printf '%s\n' image-default > /etc/bootc-tmt-merge/default.conf && \
           printf '%s\n' image-only > /etc/bootc-tmt-merge/image-only.conf
       EOF
