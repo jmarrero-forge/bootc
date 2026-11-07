@@ -32,6 +32,7 @@ mandown = "1.1.0"
 # Parse source links without round-tripping Markdown through roff/HTML.
 pulldown-cmark = "0.13"
 rand = "0.10"
+semver = "1.0"
 serde_yaml = "0.9"
 tar = "0.4"
 itertools = "0.15.0"
