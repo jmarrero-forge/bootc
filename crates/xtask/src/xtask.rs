@@ -355,6 +355,9 @@ pub(crate) enum Installer {
     /// `readonly` plan after the upgrade
     #[default]
     ToDisk,
+    /// `bootc install to-filesystem` onto a root filesystem made by the stock
+    /// mkfs (for ext4, without fs-verity), as Anaconda or a cloud image would
+    ToFilesystem,
 }
 
 /// Arguments for the test-upgrade-pinned command
@@ -383,6 +386,10 @@ pub(crate) struct PinnedUpgradeArgs {
     /// Name of the image with the release's bootc; it is tagged with the release
     #[arg(long, default_value = "localhost/bootc-pinned")]
     pub(crate) pinned_image: String,
+
+    /// For to-filesystem installs: a second image to upgrade to afterwards
+    #[arg(long, default_value = "localhost/bootc-upgrade")]
+    pub(crate) upgrade_image: String,
 
     /// Backend: ostree or composefs
     #[arg(long, env = "BOOTC_variant", default_value = "ostree")]
