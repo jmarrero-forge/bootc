@@ -1,0 +1,127 @@
+# Upgrade tests from pinned bootc releases (#2632)
+#
+# The per-PR test-upgrade job starts from whatever bootc the published base
+# image ships that day. These start from explicit releases instead, built
+# onto the current base image: each row installs one release with that
+# release's bootc, upgrades it to the bootc built from this commit, and
+# checks the result. See `just test-upgrade-pinned` and
+# crates/xtask/src/pinned.rs.
+#
+# The rows come from the cases of #2629:
+# - to-disk: the upgrade boots and the readonly tests pass, for ostree and
+#   composefs, from the last release before 1.16 changed how composefs
+#   installs check fs-verity (v1.15.2), the first and last 1.16 releases,
+#   and the latest release;
+# - to-filesystem onto ext4 made without fs-verity: 1.16.x installs there,
+#   and their upgraded boot fails as documented, after which the documented
+#   recovery steps work; other releases refuse to install.
+#
+# The `installer` axis is where image-builder and Anaconda installs go.
+name: Pinned upgrade tests
+
+permissions:
+  contents: read
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"  # Weekly, Monday 03:17 UTC
+  workflow_dispatch: {}
+  # For PRs that touch install, boot or initramfs code: add the label
+  pull_request:
+    branches: [main]
+    types: [labeled]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # See ci.yml
+  LIBVIRT_DEFAULT_URI: "qemu:///session"
+  BOOTC_CI_RETRIES: "10"
+  BOOTC_CI_DELAY: "60"
+
+jobs:
+  package:
+    if: github.event_name != 'pull_request' || github.event.label.name == 'ci/upgrade-pinned'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - name: Bootc Ubuntu Setup
+        uses: bootc-dev/actions/bootc-ubuntu-setup@main
+      - name: Setup env
+        run: |
+          printf 'BOOTC_base=%s\n' "$(just pullspec-for-os base centos-10)" >> "$GITHUB_ENV"
+      - name: Build packages
+        run: just package
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: packages-centos-10
+          path: target/packages/*.rpm
+          retention-days: 7
+
+  test:
+    needs: package
+    name: "${{ matrix.from }} ${{ matrix.variant }} ${{ matrix.filesystem }} ${{ matrix.bootloader }} ${{ matrix.installer }}"
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ matrix.from }}-${{ matrix.variant }}-${{ matrix.filesystem }}-${{ matrix.bootloader }}-${{ matrix.installer }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {from: v1.15.2, variant: ostree, filesystem: xfs, bootloader: grub, installer: to-disk}
+          - {from: latest, variant: ostree, filesystem: xfs, bootloader: grub, installer: to-disk}
+          - {from: v1.15.2, variant: composefs, filesystem: ext4, bootloader: systemd, installer: to-disk}
+          - {from: v1.16.0, variant: composefs, filesystem: ext4, bootloader: systemd, installer: to-disk}
+          - {from: v1.16.14, variant: composefs, filesystem: ext4, bootloader: systemd, installer: to-disk}
+          - {from: latest, variant: composefs, filesystem: ext4, bootloader: systemd, installer: to-disk}
+          - {from: v1.16.14, variant: composefs, filesystem: xfs, bootloader: grub, installer: to-disk}
+          - {from: latest, variant: composefs, filesystem: xfs, bootloader: grub, installer: to-disk}
+          - {from: v1.15.2, variant: composefs, filesystem: ext4, bootloader: systemd, installer: to-filesystem}
+          - {from: v1.16.0, variant: composefs, filesystem: ext4, bootloader: systemd, installer: to-filesystem}
+          - {from: v1.16.14, variant: composefs, filesystem: ext4, bootloader: systemd, installer: to-filesystem}
+          - {from: latest, variant: composefs, filesystem: ext4, bootloader: systemd, installer: to-filesystem}
+
+    runs-on: ubuntu-26.04
+    # Builds a release and installs it at least once; a hung VM shouldn't
+    # hold a runner for the default 6 hours
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v7
+      - name: Bootc Ubuntu Setup
+        uses: bootc-dev/actions/bootc-ubuntu-setup@main
+        with:
+          libvirt: true
+      - name: Install tmt
+        uses: ./.github/actions/install-tmt
+
+      - name: Setup env
+        run: |
+          printf 'BOOTC_base=%s\n' "$(just pullspec-for-os base centos-10)" >> "$GITHUB_ENV"
+          printf 'BOOTC_buildroot_base=%s\n' "$(just pullspec-for-os buildroot-base centos-10)" >> "$GITHUB_ENV"
+          echo "BOOTC_variant=${{ matrix.variant }}" >> "$GITHUB_ENV"
+          echo "BOOTC_filesystem=${{ matrix.filesystem }}" >> "$GITHUB_ENV"
+          echo "BOOTC_bootloader=${{ matrix.bootloader }}" >> "$GITHUB_ENV"
+          echo "BOOTC_SKIP_PACKAGE=1" >> "$GITHUB_ENV"
+          echo "RUST_BACKTRACE=full" >> "$GITHUB_ENV"
+
+      - name: Download package artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: packages-centos-10
+          path: target/packages/
+
+      - name: Fetch external dependencies (with retry)
+        run: just build-fetch
+
+      - name: Run pinned upgrade test
+        run: just test-upgrade-pinned "${{ matrix.from }}" --installer="${{ matrix.installer }}"
+
+      - name: Archive logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: "tmt-log-pinned-${{ matrix.from }}-${{ matrix.variant }}-${{ matrix.filesystem }}-${{ matrix.bootloader }}-${{ matrix.installer }}"
+          path: /var/tmp/tmt
