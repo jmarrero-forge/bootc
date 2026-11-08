@@ -269,6 +269,8 @@ test-composefs bootloader filesystem boot_type seal_state *ARGS:
                 --filesystem={{filesystem}} \
                 --seal-state={{seal_state}} \
                 --boot-type={{boot_type}} \
+                --context=filesystem={{filesystem}} \
+                --context=bootloader={{bootloader}} \
                 {{ARGS}} \
                 $(if [ "{{boot_type}}" = "uki" ] && [ "{{seal_state}}" = "sealed" ]; then echo "readonly image-upgrade-reboot"; else echo "integration"; fi)
 

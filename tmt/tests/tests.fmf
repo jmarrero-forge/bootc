@@ -301,3 +301,13 @@ check:
     enabled: false
     because: the derived images are built in the VM, which has no keys to sign their UKIs for Secure Boot
   test: nu booted/test-composefs-xbootldr.nu
+
+/test-69-install-verity-matrix:
+  summary: Test composefs install to-filesystem onto filesystems with and without fs-verity
+  duration: 45m
+  enabled: false
+  adjust:
+  - when: distro == fedora and boot_type == bls and filesystem == ext4 and bootloader == systemd
+    enabled: true
+    because: it doesn't depend on the booted system, so one cell is enough, and Fedora has btrfs
+  test: nu booted/test-install-verity-matrix.nu
