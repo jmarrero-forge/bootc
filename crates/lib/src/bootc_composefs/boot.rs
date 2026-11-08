@@ -95,7 +95,7 @@ use composefs_ctl::composefs;
 use composefs_ctl::composefs_boot;
 use composefs_ctl::composefs_oci;
 use fn_error_context::context;
-use linux_kernel_cmdline::utf8::{Cmdline, Parameter, ParameterKey};
+use linux_kernel_cmdline::utf8::{Cmdline, CmdlineOwned, Parameter, ParameterKey};
 use ostree_ext::composefs::dumpfile;
 use ostree_ext::composefs_boot::bootloader::Type2Entry;
 use rustix::{mount::MountFlags, path::Arg};
@@ -807,6 +807,22 @@ fn replace_composefs_karg(cmdline: &mut Cmdline, new_karg: &str) -> Result<()> {
     Ok(())
 }
 
+/// The command line of an upgrade's BLS entry: the booted entry's options
+/// with its composefs karg replaced by one for `id`, keeping the booted
+/// fs-verity policy (`?`).
+fn upgrade_bls_cmdline(
+    mut cmdline: CmdlineOwned,
+    id: &Sha512HashValue,
+    format_version: FormatVersion,
+    allow_missing_fsverity: bool,
+) -> Result<CmdlineOwned> {
+    replace_composefs_karg(
+        &mut cmdline,
+        &build_composefs_karg(id.clone(), format_version, allow_missing_fsverity),
+    )?;
+    Ok(cmdline)
+}
+
 /// Sets up and writes BLS entries and binaries (VMLinuz + Initrd) to disk
 ///
 /// # Returns
@@ -874,24 +890,19 @@ pub(crate) fn setup_composefs_bls_boot(
             let boot_dir = storage.require_boot_dir()?;
             let current_cfg = get_booted_bls(&boot_dir, booted_cfs)?;
 
-            let mut cmdline = match current_cfg.cfg_type {
+            let options = match current_cfg.cfg_type {
                 BLSConfigType::NonEFI { options, .. } => {
-                    let options = options
-                        .ok_or_else(|| anyhow::anyhow!("No 'options' found in BLS Config"))?;
-
-                    Cmdline::from(options)
+                    options.ok_or_else(|| anyhow::anyhow!("No 'options' found in BLS Config"))?
                 }
 
                 _ => anyhow::bail!("Found NonEFI config"),
             };
 
-            replace_composefs_karg(
-                &mut cmdline,
-                &build_composefs_karg(
-                    id.clone(),
-                    format_version,
-                    booted_cfs.cmdline.allow_missing_fsverity,
-                ),
+            let cmdline = upgrade_bls_cmdline(
+                options,
+                id,
+                format_version,
+                booted_cfs.cmdline.allow_missing_fsverity,
             )?;
 
             (
@@ -3067,6 +3078,57 @@ mod tests {
         assert!(!rendered.contains("composefs=old"));
         assert!(!rendered.contains(":stale"));
         assert!(rendered.contains("root=UUID=abc"));
+    }
+
+    /// A BLS upgrade keeps the booted policy, so a `?` (added at install, or
+    /// by hand to recover) survives it in both karg formats, also when the
+    /// EROFS format changes.
+    #[test]
+    fn test_bls_upgrade_keeps_allow_missing_verity() -> Result<()> {
+        use crate::bootc_composefs::status::ComposefsCmdline;
+
+        let old = "ab".repeat(64);
+        let new_hex = "cd".repeat(64);
+        let new = Sha512HashValue::from_hex(&new_hex)?;
+        // (booted composefs karg(s), whether they allow missing fs-verity)
+        let booted = [
+            (format!("composefs={old}"), false),
+            (format!("composefs=?{old}"), true),
+            (format!("composefs.digest=v1-sha512-12:{old}"), false),
+            (format!("composefs.digest=?v1-sha512-12:{old}"), true),
+            (
+                format!("composefs=?{old} composefs.digest=?v1-sha512-12:{old}"),
+                true,
+            ),
+        ];
+        for (karg, relaxed) in booted {
+            let options = format!("root=UUID=abc rw {karg} quiet");
+            let booted_cfs = ComposefsCmdline::find_in_cmdline(&Cmdline::from(options.as_str()))?
+                .expect("composefs argument should be present");
+            assert_eq!(booted_cfs.allow_missing_fsverity, relaxed, "{karg}");
+
+            let q = if relaxed { "?" } else { "" };
+            for (format, expected) in [
+                (
+                    FormatVersion::V1,
+                    format!("composefs.digest={q}v1-sha512-12:{new_hex}"),
+                ),
+                (FormatVersion::V2, format!("composefs={q}{new_hex}")),
+            ] {
+                let cmdline = upgrade_bls_cmdline(
+                    Cmdline::from(options.clone()),
+                    &new,
+                    format,
+                    booted_cfs.allow_missing_fsverity,
+                )?;
+                assert_eq!(
+                    cmdline.to_string(),
+                    format!("root=UUID=abc rw quiet {expected}"),
+                    "{karg} -> {format:?}"
+                );
+            }
+        }
+        Ok(())
     }
 
     #[tokio::test]
