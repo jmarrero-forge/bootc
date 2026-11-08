@@ -870,6 +870,10 @@ pub(crate) enum InternalsOpts {
     #[clap(subcommand)]
     Selinux(SelinuxOpts),
     /// Perform consistency checking.
+    ///
+    /// When run from a privileged container of a newer image
+    /// (`podman run --privileged --pid=host -v /:/target IMAGE bootc internals fsck`),
+    /// only the composefs boot entry check runs, against the host at `/target`.
     Fsck,
     /// Perform cleanup actions
     Cleanup,
@@ -2669,9 +2673,13 @@ async fn run_from_opt(opt: Opt) -> Result<CliExitStatus> {
             InternalsOpts::Cfs { args } => composefs_ctl::run_from_iter(args.iter()).await,
             InternalsOpts::Reboot => crate::reboot::reboot(),
             InternalsOpts::Fsck => {
-                let storage = &get_storage().await?;
-                crate::fsck::fsck(&storage, std::io::stdout().lock()).await?;
-                Ok(())
+                let output = std::io::stdout().lock();
+                if ostree_ext::container_utils::running_in_container() {
+                    crate::fsck::fsck_composefs_host(crate::fsck::HOST_ROOT.into(), output)
+                } else {
+                    let storage = &get_storage().await?;
+                    crate::fsck::fsck(&storage, output).await
+                }
             }
             InternalsOpts::FixupEtcFstab => crate::deploy::fixup_etc_fstab(&root),
             InternalsOpts::SysusersSync => crate::sysusers_cleanup::run(&root),

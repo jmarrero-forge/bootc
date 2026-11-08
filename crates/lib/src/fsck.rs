@@ -10,8 +10,9 @@ use std::future::Future;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 
+use anyhow::Context as _;
 use bootc_utils::collect_until;
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use cap_std::fs::{Dir, MetadataExt as _};
 use cap_std_ext::cap_std;
 use cap_std_ext::dirext::CapStdExtDirExt;
@@ -21,6 +22,8 @@ use linkme::distributed_slice;
 use ostree_ext::ostree;
 use ostree_ext::ostree_prepareroot::Tristate;
 
+use crate::bootc_composefs::fsck as cfsck;
+use crate::bootc_composefs::status::composefs_booted;
 use crate::store::Storage;
 
 use std::os::fd::AsFd;
@@ -32,6 +35,23 @@ pub(crate) enum CheckFindingCode {
     ResolvconfZeroSized,
     /// fsverity is enabled for the ostree repository, but not on an object.
     ObjectWithoutFsverity,
+    /// A strict composefs boot entry's image has no fs-verity, and the root
+    /// filesystem doesn't support it.
+    StrictEntryWithoutFsverity,
+    /// A strict composefs boot entry's image has no fs-verity, although the
+    /// root filesystem supports it.
+    ImageWithoutFsverity,
+    /// None of a composefs boot entry's images exist.
+    ComposefsImageMissing,
+    /// The initramfs would refuse a composefs boot entry for another reason.
+    UnbootableComposefsEntry,
+    /// No composefs boot entry was found, although the system booted from one.
+    NoComposefsBootEntries,
+    /// The boot entries weren't checked (informational).
+    ComposefsBootEntriesNotChecked,
+    /// The composefs repository's `meta.json` has no fs-verity under a
+    /// strict boot (informational).
+    MetaJsonWithoutFsverity,
 }
 
 impl std::fmt::Display for CheckFindingCode {
@@ -47,6 +67,8 @@ pub(crate) struct CheckFinding {
     /// What the problem is in, e.g. a path or an object.
     subject: String,
     detail: String,
+    /// Informational findings are printed, but don't fail the check.
+    informational: bool,
 }
 
 impl CheckFinding {
@@ -55,6 +77,15 @@ impl CheckFinding {
             code,
             subject: subject.into(),
             detail: detail.into(),
+            informational: false,
+        }
+    }
+
+    /// A finding that doesn't fail the check.
+    fn info(code: CheckFindingCode, subject: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            informational: true,
+            ..Self::new(code, subject, detail)
         }
     }
 }
@@ -293,6 +324,143 @@ async fn check_fsverity_inner(storage: &Storage) -> FsckResult {
     Ok(findings)
 }
 
+/// Where the host's root is mounted when running from a container, as for
+/// `install to-existing-root`.
+pub(crate) const HOST_ROOT: &str = "/target";
+
+/// The name of the composefs boot entry check.
+const COMPOSEFS_BOOT_POLICY: &str = "composefs-boot-policy";
+
+#[distributed_slice(FSCK_CHECKS)]
+static CHECK_COMPOSEFS_BOOT_POLICY: FsckCheck = FsckCheck::new(
+    COMPOSEFS_BOOT_POLICY,
+    20,
+    FsckFnImpl::Sync(check_composefs_boot_policy),
+);
+/// Check that every strict composefs boot entry can boot, i.e. that the
+/// image it names has fs-verity. See `bootc_composefs::fsck`.
+fn check_composefs_boot_policy(storage: &Storage) -> FsckResult {
+    let Some(booted) = composefs_booted()? else {
+        return Ok(Vec::new());
+    };
+    let boot_dirs = cfsck::boot_dirs_from_storage(storage)?;
+    if boot_dirs.is_empty() {
+        // Android boot images, whose command line isn't parsed here
+        return Ok(vec![CheckFinding::info(
+            CheckFindingCode::ComposefsBootEntriesNotChecked,
+            "boot entries",
+            "no ESP or boot directory (aboot), not checked",
+        )]);
+    }
+    let report = cfsck::check_boot_entries(&storage.physical_root, &boot_dirs)?;
+    Ok(boot_policy_findings(
+        &report,
+        !booted.allow_missing_fsverity,
+    ))
+}
+
+/// Turn a boot entry report into findings. `booted_strict` is whether the
+/// booted entry is strict.
+fn boot_policy_findings(
+    report: &cfsck::BootPolicyReport,
+    booted_strict: bool,
+) -> Vec<CheckFinding> {
+    use cfsck::{EntryKind, Verdict};
+    let mut findings = report
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            let (code, detail) = match &entry.verdict {
+                Verdict::NotComposefs | Verdict::Relaxed | Verdict::Verified => return None,
+                Verdict::StrictWithoutFsverity {
+                    image,
+                    filesystem_supports_fsverity: false,
+                } => {
+                    let fix = match entry.kind {
+                        EntryKind::Bls => {
+                            "add '?' right after `composefs=` (or `composefs.digest=`) \
+                             in the entry, then reboot before upgrading, or reinstall onto a \
+                             filesystem with fs-verity to keep enforcement"
+                                .to_owned()
+                        }
+                        EntryKind::Uki => {
+                            "the command line is embedded in the UKI, so it can't be \
+                             repaired: boot the previous UKI, or reinstall onto a filesystem \
+                             with fs-verity"
+                                .to_owned()
+                        }
+                    };
+                    (
+                        CheckFindingCode::StrictEntryWithoutFsverity,
+                        format!(
+                            "strict, but image {image} has no fs-verity and the root filesystem \
+                             doesn't support it (e.g. ext4 without '-O verity'), so it fails to \
+                             boot; {fix}"
+                        ),
+                    )
+                }
+                Verdict::StrictWithoutFsverity {
+                    image,
+                    filesystem_supports_fsverity: true,
+                } => (
+                    CheckFindingCode::ImageWithoutFsverity,
+                    format!(
+                        "strict, but image {image} has no fs-verity although the root \
+                         filesystem supports it, so it fails to boot"
+                    ),
+                ),
+                Verdict::NoImage(e) => (CheckFindingCode::ComposefsImageMissing, e.clone()),
+                Verdict::Unbootable(e) => (CheckFindingCode::UnbootableComposefsEntry, e.clone()),
+            };
+            Some(CheckFinding::new(code, &entry.path, detail))
+        })
+        .collect::<Vec<_>>();
+    if report.entries.is_empty() {
+        let searched = if report.searched.is_empty() {
+            "none".to_owned()
+        } else {
+            report.searched.join(", ")
+        };
+        findings.push(CheckFinding::new(
+            CheckFindingCode::NoComposefsBootEntries,
+            "boot entries",
+            format!("no composefs boot entry found (searched: {searched})"),
+        ));
+    }
+    if booted_strict && !report.meta_json_has_fsverity {
+        findings.push(CheckFinding::info(
+            CheckFindingCode::MetaJsonWithoutFsverity,
+            "composefs/meta.json",
+            "no fs-verity (left by bootc 1.16.x installs; the initramfs doesn't read it)",
+        ));
+    }
+    findings
+}
+
+/// Check the composefs boot entries of the host whose root is mounted at
+/// `target`, from a privileged container. Only the composefs boot entry
+/// check runs this way.
+pub(crate) fn fsck_composefs_host(
+    target: &Utf8Path,
+    mut output: impl std::io::Write,
+) -> anyhow::Result<()> {
+    let cmdline = std::fs::read_to_string("/proc/cmdline").context("Reading /proc/cmdline")?;
+    let candidates = bootc_initramfs_setup::parse_composefs_candidates(&cmdline)
+        .context("Parsing the host's kernel command line")?;
+    anyhow::ensure!(
+        !candidates.is_empty(),
+        "The host is not booted with composefs"
+    );
+    let booted_strict = !bootc_initramfs_setup::composefs_candidates_policy(&candidates)?;
+    let layout = cfsck::HostLayout::open(target)?;
+    let r = cfsck::check_boot_entries(&layout.physical_root, &layout.boot_dirs)
+        .map(|report| boot_policy_findings(&report, booted_strict));
+    if !print_check_result(COMPOSEFS_BOOT_POLICY, &r, &mut output)? {
+        anyhow::bail!("Encountered errors")
+    }
+    Ok(())
+}
+
 /// Print the result of the check `name`, returning whether it passed.
 fn print_check_result(
     name: &str,
@@ -306,7 +474,11 @@ fn print_check_result(
             return Ok(false);
         }
     };
-    let Some((shown, rest)) = collect_until(findings.iter(), MAX_PRINTED_FINDINGS) else {
+    let (infos, errors): (Vec<_>, Vec<_>) = findings.iter().partition(|f| f.informational);
+    for finding in infos {
+        writeln!(output, "fsck info: {name}: {finding}")?;
+    }
+    let Some((shown, rest)) = collect_until(errors.into_iter(), MAX_PRINTED_FINDINGS) else {
         writeln!(output, "ok: {name}")?;
         return Ok(true);
     };
@@ -399,6 +571,7 @@ mod tests {
 
     #[test]
     fn test_print_check_result() {
+        let info = || CheckFinding::info(CheckFindingCode::MetaJsonWithoutFsverity, "m", "detail");
         let objects = |n: usize| -> FsckResult {
             Ok((0..n)
                 .map(|i| {
@@ -449,6 +622,24 @@ mod tests {
                 false,
                 "Unexpected runtime error in check c: outer: inner\n",
             ),
+            (
+                "only informational",
+                Ok(vec![info()]),
+                true,
+                "fsck info: c: MetaJsonWithoutFsverity: m: detail\nok: c\n",
+            ),
+            (
+                "informational and an error",
+                objects(1).map(|mut v| {
+                    v.insert(0, info());
+                    v
+                }),
+                false,
+                indoc::indoc! {"
+                    fsck info: c: MetaJsonWithoutFsverity: m: detail
+                    fsck error: c: ObjectWithoutFsverity: 00.file: detail
+                "},
+            ),
         ];
         for (name, result, passed, expected) in cases {
             let mut output = Vec::new();
@@ -456,5 +647,103 @@ mod tests {
             assert_eq!(r, *passed, "case {name}");
             assert_eq!(String::from_utf8(output).unwrap(), *expected, "case {name}");
         }
+    }
+
+    #[test]
+    fn test_boot_policy_findings() {
+        use cfsck::{BootPolicyReport, EntryKind, EntryReport, Verdict};
+        let entry = |kind, path: &str, verdict| EntryReport {
+            kind,
+            path: path.into(),
+            verdict,
+        };
+        let without = |filesystem_supports_fsverity| Verdict::StrictWithoutFsverity {
+            image: "aa".into(),
+            filesystem_supports_fsverity,
+        };
+        let report = |meta_json_has_fsverity| BootPolicyReport {
+            entries: vec![
+                entry(EntryKind::Bls, "ok", Verdict::Verified),
+                entry(EntryKind::Bls, "relaxed", Verdict::Relaxed),
+                entry(EntryKind::Bls, "bls", without(false)),
+                entry(EntryKind::Uki, "uki", without(false)),
+                entry(EntryKind::Bls, "missing", without(true)),
+                entry(EntryKind::Bls, "noimage", Verdict::NoImage("e".into())),
+                entry(EntryKind::Bls, "bad", Verdict::Unbootable("e".into())),
+            ],
+            searched: vec!["ESP".into()],
+            meta_json_has_fsverity,
+        };
+        let codes = |findings: Vec<CheckFinding>| {
+            findings
+                .into_iter()
+                .map(|f| (f.subject, f.code, f.informational))
+                .collect::<Vec<_>>()
+        };
+        let base = vec![
+            (
+                "bls".into(),
+                CheckFindingCode::StrictEntryWithoutFsverity,
+                false,
+            ),
+            (
+                "uki".into(),
+                CheckFindingCode::StrictEntryWithoutFsverity,
+                false,
+            ),
+            (
+                "missing".into(),
+                CheckFindingCode::ImageWithoutFsverity,
+                false,
+            ),
+            (
+                "noimage".into(),
+                CheckFindingCode::ComposefsImageMissing,
+                false,
+            ),
+            (
+                "bad".into(),
+                CheckFindingCode::UnbootableComposefsEntry,
+                false,
+            ),
+        ];
+        let mut with_meta = base.clone();
+        with_meta.push((
+            "composefs/meta.json".into(),
+            CheckFindingCode::MetaJsonWithoutFsverity,
+            true,
+        ));
+        let cases: [(bool, bool, &Vec<(String, CheckFindingCode, bool)>); 4] = [
+            (true, true, &base),
+            (true, false, &with_meta),
+            // meta.json only matters under a strict boot
+            (false, false, &base),
+            (false, true, &base),
+        ];
+        for (booted_strict, meta_json_has_fsverity, expected) in cases {
+            assert_eq!(
+                &codes(boot_policy_findings(
+                    &report(meta_json_has_fsverity),
+                    booted_strict
+                )),
+                expected,
+                "booted_strict={booted_strict} meta_json_has_fsverity={meta_json_has_fsverity}"
+            );
+        }
+        // UKIs get their own guidance
+        let findings = boot_policy_findings(&report(true), true);
+        assert!(!findings[0].detail.contains("--allow-missing-verity"));
+        assert!(findings[1].detail.contains("reinstall"));
+
+        // A composefs boot with no entries at all is an error
+        let empty = BootPolicyReport {
+            entries: Vec::new(),
+            searched: vec!["ESP".into(), "boot".into()],
+            meta_json_has_fsverity: true,
+        };
+        let findings = boot_policy_findings(&empty, true);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].code, CheckFindingCode::NoComposefsBootEntries);
+        assert!(findings[0].detail.contains("ESP, boot"));
     }
 }
