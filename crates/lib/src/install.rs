@@ -1725,6 +1725,67 @@ async fn verify_target_fetch(
 /// Carries the content of `--root-ssh-authorized-keys` across re-execs; see `prepare_install`.
 const ROOT_SSH_AUTHORIZED_KEYS_ENV: &str = "_BOOTC_ROOT_SSH_AUTHORIZED_KEYS";
 
+/// The install-time fs-verity policy of a composefs install, from [`install_verity_policy`].
+#[derive(Debug, PartialEq, Eq)]
+struct InstallVerityPolicy {
+    /// Whether missing fs-verity is allowed (`?` on the composefs karg).
+    allow_missing_verity: bool,
+    /// Whether the command line is embedded in the boot artifact (UKI or aboot).
+    immutable_boot: bool,
+}
+
+/// Decide whether a composefs install allows missing fs-verity, from the
+/// root filesystem type (when known), the boot artifact and the explicit
+/// `--allow-missing-verity` flag.
+fn install_verity_policy(
+    root_filesystem: Option<FilesystemEnum>,
+    kernel: Option<&crate::kernel::KernelType>,
+    composefs_backend: bool,
+    allow_missing_verity_explicit: bool,
+) -> Result<InstallVerityPolicy> {
+    // Without a filesystem type (it may come from repart.d definitions), keep the flag
+    let Some(root_filesystem) = root_filesystem else {
+        return Ok(InstallVerityPolicy {
+            allow_missing_verity: allow_missing_verity_explicit,
+            immutable_boot: false,
+        });
+    };
+
+    // If we have a sealed UKI on our hands, then we can assume that user wanted fs-verity so
+    // we hard require it in that particular case
+    //
+    // NOTE: This isn't really 100% accurate 100% of the time as the cmdline can be in an addon
+    if let Some(kernel) = kernel.filter(|k| k.is_unified()) {
+        let allow_missing_verity = match kernel.cmdline() {
+            Some(cmdline) => ComposefsCmdline::find_in_cmdline(cmdline)?
+                .is_some_and(|cfs_cmdline| cfs_cmdline.allow_missing_fsverity),
+            None => false,
+        };
+
+        if !allow_missing_verity {
+            anyhow::ensure!(
+                root_filesystem.supports_fsverity(),
+                "Specified filesystem {root_filesystem} does not support fs-verity"
+            );
+        }
+
+        return Ok(InstallVerityPolicy {
+            allow_missing_verity,
+            immutable_boot: true,
+        });
+    }
+
+    // For composefs backend, automatically disable fs-verity hard requirement if the
+    // filesystem doesn't support it. If `--allow-missing-verity` is already passed
+    // via CLI, don't modify it.
+    let allow_missing_verity = allow_missing_verity_explicit
+        || (composefs_backend && !root_filesystem.supports_fsverity());
+    Ok(InstallVerityPolicy {
+        allow_missing_verity,
+        immutable_boot: false,
+    })
+}
+
 /// Preparation for an install; validates and prepares some (thereafter immutable) global state.
 async fn prepare_install(
     mut config_opts: InstallConfigOpts,
@@ -1972,42 +2033,16 @@ async fn prepare_install(
         .and_then(|c| c.filesystem_root())
         .and_then(|r| r.fstype));
 
-    let mut immutable_boot = false;
-
-    // For composefs backend, automatically disable fs-verity hard requirement if the
-    // filesystem doesn't support it
-    //
-    // If we have a sealed UKI on our hands, then we can assume that user wanted fs-verity so
-    // we hard require it in that particular case
-    //
-    // NOTE: This isn't really 100% accurate 100% of the time as the cmdline can be in an addon
-    if let Some(root_filesystem) = root_filesystem {
-        if let Some(kernel) = kernel.as_ref().filter(|k| k.k_type.is_unified()) {
-            let allow_missing_fsverity = match kernel.k_type.cmdline() {
-                Some(cmdline) => ComposefsCmdline::find_in_cmdline(cmdline)?
-                    .is_some_and(|cfs_cmdline| cfs_cmdline.allow_missing_fsverity),
-                None => false,
-            };
-
-            if !allow_missing_fsverity {
-                anyhow::ensure!(
-                    root_filesystem.supports_fsverity(),
-                    "Specified filesystem {root_filesystem} does not support fs-verity"
-                );
-            }
-
-            composefs_options.allow_missing_verity = allow_missing_fsverity;
-            immutable_boot = true;
-        }
-
-        // If `--allow-missing-verity` is already passed via CLI, don't modify
-        if composefs_options.composefs_backend
-            && !composefs_options.allow_missing_verity
-            && !immutable_boot
-        {
-            composefs_options.allow_missing_verity = !root_filesystem.supports_fsverity();
-        }
-    }
+    let InstallVerityPolicy {
+        allow_missing_verity,
+        immutable_boot,
+    } = install_verity_policy(
+        root_filesystem,
+        kernel.as_ref().map(|k| &k.k_type),
+        composefs_options.composefs_backend,
+        allow_missing_verity_explicit,
+    )?;
+    composefs_options.allow_missing_verity = allow_missing_verity;
 
     tracing::info!(
         root_filesystem = root_filesystem
@@ -3329,6 +3364,113 @@ mod tests {
                 .to_string(),
             "stateroot myroot in the install configuration is not supported with the composefs backend, which only uses default"
         );
+    }
+
+    #[test]
+    fn test_install_verity_policy() {
+        use crate::kernel::KernelType;
+        use composefs_ctl::composefs_boot::bootloader::AbootEncoding;
+
+        // The resulting policy: `?` on the composefs karg, none, or the install is refused
+        const RELAXED: Option<bool> = Some(true);
+        const STRICT: Option<bool> = Some(false);
+        const REFUSED: Option<bool> = None;
+        const XFS: Option<FilesystemEnum> = Some(FilesystemEnum::Xfs);
+        const EXT4: Option<FilesystemEnum> = Some(FilesystemEnum::Ext4);
+        const BTRFS: Option<FilesystemEnum> = Some(FilesystemEnum::Btrfs);
+        const UNKNOWN: Option<FilesystemEnum> = None;
+
+        let hex = "ab".repeat(64);
+        let strict_cmdline = format!("root=UUID=abc composefs={hex}");
+        let relaxed_cmdline = format!("root=UUID=abc composefs=?{hex}");
+        let uki = |cmdline: Option<&str>| KernelType::Uki {
+            path: "boot/EFI/Linux/test.efi".into(),
+            cmdline: cmdline.map(|c| Cmdline::from(c.to_owned())),
+        };
+        let aboot = |cmdline: &str| KernelType::Aboot {
+            path: "boot/aboot.img".into(),
+            encoding: AbootEncoding::AndroidV2,
+            cmdline: Cmdline::from(cmdline.to_owned()),
+        };
+        let vmlinuz = KernelType::Vmlinuz {
+            path: "usr/lib/modules/6.0/vmlinuz".into(),
+            initramfs: "usr/lib/modules/6.0/initramfs.img".into(),
+        };
+        let kernels = [
+            uki(Some(&strict_cmdline)),
+            uki(Some(&relaxed_cmdline)),
+            uki(None),
+            aboot(&strict_cmdline),
+            aboot(&relaxed_cmdline),
+        ];
+        // (label, kernel) pairs for the table
+        let bls = ("bls", Some(&vmlinuz));
+        let no_kernel = ("no kernel", None);
+        let uki_strict = ("strict uki", Some(&kernels[0]));
+        let uki_relaxed = ("relaxed uki", Some(&kernels[1]));
+        let uki_bare = ("uki without cmdline", Some(&kernels[2]));
+        let aboot_strict = ("strict aboot", Some(&kernels[3]));
+        let aboot_relaxed = ("relaxed aboot", Some(&kernels[4]));
+
+        // (composefs_backend, kernel, root filesystem,
+        //  [policy without, with --allow-missing-verity])
+        let cases = [
+            // BLS: the type-only default, `?` where the filesystem lacks fs-verity
+            (true, bls, XFS, [RELAXED, RELAXED]),
+            (true, bls, EXT4, [STRICT, RELAXED]),
+            (true, bls, BTRFS, [STRICT, RELAXED]),
+            (true, bls, UNKNOWN, [STRICT, RELAXED]),
+            (true, no_kernel, XFS, [RELAXED, RELAXED]),
+            (true, no_kernel, EXT4, [STRICT, RELAXED]),
+            // ostree keeps the flag (which validation refuses)
+            (false, bls, XFS, [STRICT, RELAXED]),
+            (false, bls, EXT4, [STRICT, RELAXED]),
+            // UKI and aboot: the embedded policy wins over the flag, and a
+            // strict one needs fs-verity
+            (true, uki_strict, XFS, [REFUSED, REFUSED]),
+            (true, uki_strict, EXT4, [STRICT, STRICT]),
+            (true, uki_strict, BTRFS, [STRICT, STRICT]),
+            (true, uki_strict, UNKNOWN, [STRICT, RELAXED]),
+            (true, uki_bare, XFS, [REFUSED, REFUSED]),
+            (true, uki_bare, EXT4, [STRICT, STRICT]),
+            (true, uki_relaxed, XFS, [RELAXED, RELAXED]),
+            (true, uki_relaxed, EXT4, [RELAXED, RELAXED]),
+            (true, uki_relaxed, BTRFS, [RELAXED, RELAXED]),
+            (true, uki_relaxed, UNKNOWN, [STRICT, RELAXED]),
+            (true, uki_bare, BTRFS, [STRICT, STRICT]),
+            (true, uki_bare, UNKNOWN, [STRICT, RELAXED]),
+            (true, aboot_strict, XFS, [REFUSED, REFUSED]),
+            (true, aboot_strict, EXT4, [STRICT, STRICT]),
+            (true, aboot_strict, BTRFS, [STRICT, STRICT]),
+            (true, aboot_strict, UNKNOWN, [STRICT, RELAXED]),
+            (true, aboot_relaxed, XFS, [RELAXED, RELAXED]),
+            (true, aboot_relaxed, EXT4, [RELAXED, RELAXED]),
+            (true, aboot_relaxed, BTRFS, [RELAXED, RELAXED]),
+            (true, aboot_relaxed, UNKNOWN, [STRICT, RELAXED]),
+        ];
+
+        for (composefs_backend, (name, kernel), fs, expected) in cases {
+            for (explicit, expected) in [false, true].into_iter().zip(expected) {
+                let result = install_verity_policy(fs, kernel, composefs_backend, explicit);
+                let ctx =
+                    format!("{name} on {fs:?}, composefs={composefs_backend} explicit={explicit}");
+                match (result, expected) {
+                    (Ok(policy), Some(expected)) => {
+                        let unified = kernel.is_some_and(|k| k.is_unified());
+                        let want = InstallVerityPolicy {
+                            allow_missing_verity: expected,
+                            immutable_boot: unified && fs.is_some(),
+                        };
+                        assert_eq!(policy, want, "{ctx}");
+                    }
+                    (Err(e), None) => assert!(
+                        e.to_string().contains("does not support fs-verity"),
+                        "{ctx}: {e:#}"
+                    ),
+                    (result, expected) => panic!("{ctx}: got {result:?}, expected {expected:?}"),
+                }
+            }
+        }
     }
 
     #[test]
