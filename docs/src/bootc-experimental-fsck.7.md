@@ -6,7 +6,7 @@ do provide feedback on them.
 ## Using `bootc internals fsck`
 
 This command expects a booted system, and performs consistency checks
-in a read-only fashion.
+in a read-only fashion, unless asked to repair (see below).
 
 ## composefs boot entries
 
@@ -21,11 +21,18 @@ supports fs-verity at all. bootc 1.16.0 through 1.16.14 created such
 entries when installing with `install to-filesystem` or `to-existing-root`
 onto ext4 created without `-O verity`.
 
+`--repair-allow-missing-verity` adds `?` to those BLS entries, but only when
+the root filesystem doesn't support fs-verity, so that they boot without
+fs-verity enforcement. Reboot before upgrading, since upgrades copy the
+policy of the booted entry. To keep enforcement instead, reinstall onto a
+filesystem with fs-verity. UKIs can't be repaired this way, because their
+command line is embedded in them.
+
 The check can run from a newer image before upgrading:
 
 ```
 podman run --rm --privileged --pid=host -v /:/target IMAGE \
-    bootc internals fsck
+    bootc internals fsck [--repair-allow-missing-verity]
 ```
 
 Run this way, only the composefs boot entry check runs.

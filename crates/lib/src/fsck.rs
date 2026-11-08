@@ -331,6 +331,9 @@ pub(crate) const HOST_ROOT: &str = "/target";
 /// The name of the composefs boot entry check.
 const COMPOSEFS_BOOT_POLICY: &str = "composefs-boot-policy";
 
+/// The fix offered for strict BLS entries on a filesystem without fs-verity.
+const REPAIR_FLAG: &str = "--repair-allow-missing-verity";
+
 #[distributed_slice(FSCK_CHECKS)]
 static CHECK_COMPOSEFS_BOOT_POLICY: FsckCheck = FsckCheck::new(
     COMPOSEFS_BOOT_POLICY,
@@ -377,18 +380,14 @@ fn boot_policy_findings(
                     filesystem_supports_fsverity: false,
                 } => {
                     let fix = match entry.kind {
-                        EntryKind::Bls => {
-                            "add '?' right after `composefs=` (or `composefs.digest=`) \
-                             in the entry, then reboot before upgrading, or reinstall onto a \
+                        EntryKind::Bls => format!(
+                            "add '?' with `bootc internals fsck {REPAIR_FLAG}`, or reinstall onto a \
                              filesystem with fs-verity to keep enforcement"
-                                .to_owned()
-                        }
-                        EntryKind::Uki => {
-                            "the command line is embedded in the UKI, so it can't be \
-                             repaired: boot the previous UKI, or reinstall onto a filesystem \
-                             with fs-verity"
-                                .to_owned()
-                        }
+                        ),
+                        EntryKind::Uki => "the command line is embedded in the UKI, so it can't be \
+                             repaired: boot the previous UKI, or reinstall onto a filesystem with \
+                             fs-verity"
+                            .to_owned(),
                     };
                     (
                         CheckFindingCode::StrictEntryWithoutFsverity,
@@ -437,11 +436,41 @@ fn boot_policy_findings(
     findings
 }
 
-/// Check the composefs boot entries of the host whose root is mounted at
-/// `target`, from a privileged container. Only the composefs boot entry
-/// check runs this way.
+/// Add `?` to the strict BLS entries that can't boot because the root
+/// filesystem doesn't support fs-verity, and print what was done.
+fn repair_composefs_boot_policy(
+    physical_root: &Dir,
+    boot_dirs: &[cfsck::BootDir],
+    mut output: impl std::io::Write,
+) -> anyhow::Result<()> {
+    let repaired = cfsck::repair_bls_entries(physical_root, boot_dirs)?;
+    if repaired.is_empty() {
+        writeln!(output, "{REPAIR_FLAG}: no boot entries to repair")?;
+        return Ok(());
+    }
+    writeln!(
+        output,
+        "{REPAIR_FLAG}: added '?' to these boot entries, so they boot without fs-verity \
+         enforcement, which this root filesystem can't provide:"
+    )?;
+    for path in repaired {
+        writeln!(output, "  {path}")?;
+    }
+    writeln!(
+        output,
+        "Reboot before upgrading: upgrades copy the policy of the booted entry.\n\
+         To keep fs-verity enforcement instead, reinstall onto a filesystem with fs-verity \
+         (e.g. ext4 created with '-O verity')."
+    )?;
+    Ok(())
+}
+
+/// Check, and with `repair` repair, the composefs boot entries of the host
+/// whose root is mounted at `target`, from a privileged container. Only the
+/// composefs boot entry check runs this way.
 pub(crate) fn fsck_composefs_host(
     target: &Utf8Path,
+    repair: bool,
     mut output: impl std::io::Write,
 ) -> anyhow::Result<()> {
     let cmdline = std::fs::read_to_string("/proc/cmdline").context("Reading /proc/cmdline")?;
@@ -452,7 +481,10 @@ pub(crate) fn fsck_composefs_host(
         "The host is not booted with composefs"
     );
     let booted_strict = !bootc_initramfs_setup::composefs_candidates_policy(&candidates)?;
-    let layout = cfsck::HostLayout::open(target)?;
+    let layout = cfsck::HostLayout::open(target, repair)?;
+    if repair {
+        repair_composefs_boot_policy(&layout.physical_root, &layout.boot_dirs, &mut output)?;
+    }
     let r = cfsck::check_boot_entries(&layout.physical_root, &layout.boot_dirs)
         .map(|report| boot_policy_findings(&report, booted_strict));
     if !print_check_result(COMPOSEFS_BOOT_POLICY, &r, &mut output)? {
@@ -491,7 +523,21 @@ fn print_check_result(
     Ok(false)
 }
 
-pub(crate) async fn fsck(storage: &Storage, mut output: impl std::io::Write) -> anyhow::Result<()> {
+/// Run all checks. With `repair`, first add `?` to the composefs boot
+/// entries that need it (see [`repair_composefs_boot_policy`]).
+pub(crate) async fn fsck(
+    storage: &Storage,
+    repair: bool,
+    mut output: impl std::io::Write,
+) -> anyhow::Result<()> {
+    if repair {
+        anyhow::ensure!(
+            composefs_booted()?.is_some(),
+            "{REPAIR_FLAG} only applies to systems booted with composefs"
+        );
+        let boot_dirs = cfsck::boot_dirs_from_storage(storage)?;
+        repair_composefs_boot_policy(&storage.physical_root, &boot_dirs, &mut output)?;
+    }
     let mut checks = FSCK_CHECKS.static_slice().iter().collect::<Vec<_>>();
     checks.sort_by(|a, b| a.ordering.cmp(&b.ordering));
 
@@ -730,10 +776,10 @@ mod tests {
                 "booted_strict={booted_strict} meta_json_has_fsverity={meta_json_has_fsverity}"
             );
         }
-        // UKIs get their own guidance
+        // Only BLS entries are offered the repair
         let findings = boot_policy_findings(&report(true), true);
-        assert!(!findings[0].detail.contains("--allow-missing-verity"));
-        assert!(findings[1].detail.contains("reinstall"));
+        assert!(findings[0].detail.contains(REPAIR_FLAG));
+        assert!(!findings[1].detail.contains(REPAIR_FLAG));
 
         // A composefs boot with no entries at all is an error
         let empty = BootPolicyReport {

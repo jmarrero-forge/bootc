@@ -874,7 +874,13 @@ pub(crate) enum InternalsOpts {
     /// When run from a privileged container of a newer image
     /// (`podman run --privileged --pid=host -v /:/target IMAGE bootc internals fsck`),
     /// only the composefs boot entry check runs, against the host at `/target`.
-    Fsck,
+    Fsck {
+        /// Add `?` to strict composefs BLS boot entries whose image lacks
+        /// fs-verity because the root filesystem doesn't support it, so that
+        /// they boot without fs-verity enforcement.
+        #[clap(long)]
+        repair_allow_missing_verity: bool,
+    },
     /// Perform cleanup actions
     Cleanup,
     Relabel {
@@ -2672,13 +2678,19 @@ async fn run_from_opt(opt: Opt) -> Result<CliExitStatus> {
             }
             InternalsOpts::Cfs { args } => composefs_ctl::run_from_iter(args.iter()).await,
             InternalsOpts::Reboot => crate::reboot::reboot(),
-            InternalsOpts::Fsck => {
+            InternalsOpts::Fsck {
+                repair_allow_missing_verity,
+            } => {
                 let output = std::io::stdout().lock();
                 if ostree_ext::container_utils::running_in_container() {
-                    crate::fsck::fsck_composefs_host(crate::fsck::HOST_ROOT.into(), output)
+                    crate::fsck::fsck_composefs_host(
+                        crate::fsck::HOST_ROOT.into(),
+                        repair_allow_missing_verity,
+                        output,
+                    )
                 } else {
                     let storage = &get_storage().await?;
-                    crate::fsck::fsck(&storage, output).await
+                    crate::fsck::fsck(&storage, repair_allow_missing_verity, output).await
                 }
             }
             InternalsOpts::FixupEtcFstab => crate::deploy::fixup_etc_fstab(&root),

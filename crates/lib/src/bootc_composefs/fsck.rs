@@ -10,7 +10,7 @@
 //! initramfs enforces fs-verity.
 //!
 //! This module finds them, reading each entry's command line the way the
-//! initramfs does.
+//! initramfs does, and can add `?` to the BLS ones.
 
 use std::os::fd::AsFd;
 
@@ -27,10 +27,12 @@ use composefs::fsverity::{
     CompareVerityError, FsVerityHashValue, MeasureVerityError, Sha512HashValue,
 };
 use composefs::repository::{ImageNotFound, IntegrityPolicy, VerityState};
+use composefs_boot::cmdline::{KARG_COMPOSEFS_DIGEST, KARG_V2};
 use composefs_ctl::{composefs, composefs_boot};
 use fn_error_context::context;
+use linux_kernel_cmdline::utf8::{Cmdline, Parameter};
 
-use crate::bootc_composefs::boot::{BOOTC_UKI_DIR, mount_esp_readonly};
+use crate::bootc_composefs::boot::{BOOTC_UKI_DIR, mount_esp_readonly, mount_esp_writable};
 use crate::composefs_consts::{TYPE1_ENT_PATH, TYPE1_ENT_PATH_STAGED};
 use crate::store::{COMPOSEFS, ComposefsRepository, Storage, find_booted_from_esp};
 
@@ -307,6 +309,129 @@ pub(crate) fn check_boot_entries(
     })
 }
 
+/// Add `?` to every strict composefs argument of a kernel command line.
+fn relax_cmdline(cmdline: &str) -> String {
+    Cmdline::from(cmdline)
+        .iter_str()
+        .map(|param| {
+            let Some(p) = Parameter::parse(param) else {
+                return param.to_owned();
+            };
+            let key = p.key();
+            match p.value() {
+                Some(value)
+                    if (&*key == KARG_V2 || &*key == KARG_COMPOSEFS_DIGEST)
+                        && !value.starts_with('?') =>
+                {
+                    format!("{}=?{value}", &*key)
+                }
+                _ => param.to_owned(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Split `s` before its first character matching `f`, or at its end.
+fn split_at_first(s: &str, f: impl Fn(char) -> bool) -> (&str, &str) {
+    s.find(f).map_or((s, ""), |i| s.split_at(i))
+}
+
+/// Add `?` to the composefs arguments on the `options` lines of a BLS entry,
+/// leaving every other line as it is. Returns `None` if nothing changed.
+pub(crate) fn relax_bls_entry(contents: &str) -> Option<String> {
+    let mut changed = false;
+    let r = contents
+        .split_inclusive('\n')
+        .map(|line| {
+            let (body, ending) = split_at_first(line, |c| c == '\r' || c == '\n');
+            let (indent, body) = split_at_first(body, |c| !c.is_whitespace());
+            let Some(rest) = body.strip_prefix(BLS_OPTIONS_KEY) else {
+                return line.to_owned();
+            };
+            let (separator, value) = split_at_first(rest, |c| !c.is_whitespace());
+            if separator.is_empty() {
+                // A longer key, such as "optionsfoo"
+                return line.to_owned();
+            }
+            let value = value.trim_end();
+            let relaxed = relax_cmdline(value);
+            if relaxed == value {
+                return line.to_owned();
+            }
+            changed = true;
+            format!("{indent}{BLS_OPTIONS_KEY}{separator}{relaxed}{ending}")
+        })
+        .collect::<String>();
+    changed.then_some(r)
+}
+
+/// Add `?` to the BLS entries that `classify` finds strict without
+/// fs-verity on a filesystem that can't do fs-verity, writing each to a
+/// temporary file and renaming it over the entry. Returns the paths of the
+/// changed entries.
+fn repair_bls_entries_with(
+    boot_dirs: &[BootDir],
+    mut classify: impl FnMut(&str) -> Verdict,
+) -> Result<Vec<String>> {
+    let mut repaired = Vec::new();
+    for boot in boot_dirs {
+        for entry in list_boot_entries(&boot.dir)? {
+            if entry.kind != EntryKind::Bls {
+                continue;
+            }
+            let fixable = matches!(
+                classify(&entry.cmdline),
+                Verdict::StrictWithoutFsverity {
+                    filesystem_supports_fsverity: false,
+                    ..
+                }
+            );
+            if !fixable {
+                continue;
+            }
+            let path = format!("{}/{}", boot.label, entry.path);
+            let write = || -> Result<bool> {
+                let contents = boot.dir.read_to_string(&entry.path)?;
+                let Some(relaxed) = relax_bls_entry(&contents) else {
+                    return Ok(false);
+                };
+                let perms = boot.dir.metadata(&entry.path)?.permissions();
+                boot.dir
+                    .atomic_write_with_perms(&entry.path, relaxed, perms)?;
+                Ok(true)
+            };
+            match write() {
+                Ok(true) => repaired.push(path),
+                Ok(false) => {}
+                Err(e) => {
+                    let done = if repaired.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        repaired.join(", ")
+                    };
+                    return Err(e.context(format!("Rewriting {path} (already rewritten: {done})")));
+                }
+            }
+        }
+    }
+    Ok(repaired)
+}
+
+/// Add `?` to the BLS entries that are strict, but whose image lacks
+/// fs-verity because the filesystem doesn't support it. Returns the paths
+/// of the changed entries.
+#[context("Adding '?' to boot entries")]
+pub(crate) fn repair_bls_entries(
+    physical_root: &Dir,
+    boot_dirs: &[BootDir],
+) -> Result<Vec<String>> {
+    let (repo, _) = open_strict_repo(physical_root)?;
+    repair_bls_entries_with(boot_dirs, |cmdline| {
+        classify_cmdline(cmdline, |digest| open_image(&repo, digest))
+    })
+}
+
 /// The boot directories of a booted composefs system: the ESP, and the GRUB
 /// boot directory if that's elsewhere.
 pub(crate) fn boot_dirs_from_storage(storage: &Storage) -> Result<Vec<BootDir>> {
@@ -356,14 +481,20 @@ pub(crate) struct HostLayout {
 }
 
 impl HostLayout {
-    /// Open the host's layout under `target`.
+    /// Open the host's layout under `target`, writable if `writable`.
     #[context("Opening the host's boot directories under {target}")]
-    pub(crate) fn open(target: &Utf8Path) -> Result<Self> {
+    pub(crate) fn open(target: &Utf8Path, writable: bool) -> Result<Self> {
+        use crate::utils::open_dir_remount_rw;
+
         let root = Dir::open_ambient_dir(target, ambient_authority())
             .with_context(|| format!("Opening {target}; run the container with -v /:{target}"))?;
         let open = |dir: &Dir, path: &str| -> Result<Dir> {
-            dir.open_dir(path)
-                .with_context(|| format!("Opening {path}"))
+            if writable {
+                open_dir_remount_rw(dir, path.into())
+            } else {
+                dir.open_dir(path)
+                    .with_context(|| format!("Opening {path}"))
+            }
         };
         let physical_root = open(&root, crate::store::SYSROOT)?;
 
@@ -374,7 +505,11 @@ impl HostLayout {
             // lsblk needs the host's udev database to find the ESP's partition UUID
             bootc_mount::ensure_mirrored_host_mount("/run/udev")?;
             let device = find_booted_from_esp(&physical_root)?;
-            let mount = mount_esp_readonly(&device)?;
+            let mount = if writable {
+                mount_esp_writable(&device)?
+            } else {
+                mount_esp_readonly(&device)?
+            };
             dirs.push(BootDir {
                 label: format!("ESP ({device})"),
                 dir: mount.fd.try_clone()?,
@@ -546,6 +681,103 @@ mod tests {
         for (contents, expected) in cases {
             assert_eq!(bls_options(contents).as_deref(), expected, "{contents:?}");
         }
+    }
+
+    #[test]
+    fn test_relax_bls_entry() {
+        let strict2 = v2(1, false);
+        let relaxed2 = v2(1, true);
+        let strict1 = v1(2, false);
+        let relaxed1 = v1(2, true);
+        let cases = [
+            (
+                "v2",
+                format!("title t\nversion 1\noptions root=UUID=abc rw {strict2}\nlinux /l\n"),
+                Some(format!(
+                    "title t\nversion 1\noptions root=UUID=abc rw {relaxed2}\nlinux /l\n"
+                )),
+            ),
+            (
+                "dual, no trailing newline",
+                format!("options {strict1} {strict2} quiet"),
+                Some(format!("options {relaxed1} {relaxed2} quiet")),
+            ),
+            ("already relaxed", format!("options {relaxed2}\n"), None),
+            ("not composefs", "options root=UUID=abc rw\n".into(), None),
+            (
+                "keeps the separator, CRLF",
+                format!("options\t{strict2}\r\n"),
+                Some(format!("options\t{relaxed2}\r\n")),
+            ),
+            (
+                "only options lines",
+                format!("title {strict2}\noptions {strict2}\n"),
+                Some(format!("title {strict2}\noptions {relaxed2}\n")),
+            ),
+        ];
+        for (name, contents, expected) in cases {
+            assert_eq!(relax_bls_entry(&contents), expected, "case {name}");
+        }
+    }
+
+    #[test]
+    fn test_repair_bls_entries() -> Result<()> {
+        let td = cap_tempfile::tempdir(cap_std::ambient_authority())?;
+        td.create_dir_all(TYPE1_ENT_PATH)?;
+        td.create_dir_all(TYPE1_ENT_PATH_STAGED)?;
+        td.create_dir_all(BOOTC_UKI_DIR)?;
+        // The test's verdicts go by the digest
+        let unsupported = v2(1, false);
+        let missing = v2(2, false);
+        let verified = v2(3, false);
+        let entry = |karg: &str| format!("title t\nversion 1\nlinux /l\noptions rw {karg}\n");
+        let files = [
+            (format!("{TYPE1_ENT_PATH}/a.conf"), entry(&unsupported)),
+            (format!("{TYPE1_ENT_PATH}/b.conf"), entry(&missing)),
+            (format!("{TYPE1_ENT_PATH}/c.conf"), entry(&verified)),
+            (
+                format!("{TYPE1_ENT_PATH_STAGED}/d.conf"),
+                entry(&unsupported),
+            ),
+            // Not an entry
+            (format!("{TYPE1_ENT_PATH}/e.txt"), entry(&unsupported)),
+        ];
+        for (path, contents) in &files {
+            td.write(path, contents)?;
+        }
+        let boot_dirs = [BootDir {
+            label: "boot".into(),
+            dir: td.try_clone()?,
+        }];
+        let classify = |cmdline: &str| {
+            classify_cmdline(cmdline, |d| {
+                Some(match d {
+                    d if *d == digest(1) => ImageState::FilesystemNotSupported,
+                    d if *d == digest(2) => ImageState::VerityMissing,
+                    _ => ImageState::Verified,
+                })
+            })
+        };
+        let repaired = repair_bls_entries_with(&boot_dirs, classify)?;
+        assert_eq!(
+            repaired,
+            [
+                format!("boot/{TYPE1_ENT_PATH}/a.conf"),
+                format!("boot/{TYPE1_ENT_PATH_STAGED}/d.conf"),
+            ]
+        );
+        let relaxed = entry(&v2(1, true));
+        for (path, contents) in &files {
+            let expected = if path.ends_with("a.conf") || path.ends_with("d.conf") {
+                &relaxed
+            } else {
+                contents
+            };
+            assert_eq!(&td.read_to_string(path)?, expected, "{path}");
+        }
+        // A second run has nothing left to do
+        assert!(repair_bls_entries_with(&boot_dirs, classify)?.is_empty());
+        Ok(())
     }
 
     /// Check entries against a real repository, so that a change in how
