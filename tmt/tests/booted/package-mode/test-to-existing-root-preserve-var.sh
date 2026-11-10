@@ -286,7 +286,7 @@ case ${TMT_REBOOT_COUNT:-0} in
                 --security-opt label=type:unconfined_t \
                 "$target_image" \
                 bash -euo pipefail -c '
-                    deployment=/mnt/bootc-tmt-deployment
+                    deployment=/run/bootc-tmt-deployment
                     cleanup() {
                         local status=$?
                         trap - EXIT
