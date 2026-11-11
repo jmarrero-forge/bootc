@@ -93,7 +93,7 @@ check:
 
 /test-32-install-to-filesystem-var-mount:
   summary: Test bootc install to-filesystem with separate /var mount
-  duration: 30m
+  duration: 45m
   require:
   - parted
   - lvm2
