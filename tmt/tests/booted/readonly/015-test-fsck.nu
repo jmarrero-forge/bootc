@@ -3,15 +3,14 @@ use tap.nu
 
 tap begin "Run fsck"
 
-# Detect composefs by checking if composefs field is present
-let st = bootc status --json | from json
-let is_composefs = (tap is_composefs)
+# That's it, just ensure we've run a fsck on our basic install.
+let out = bootc internals fsck
+print $out
 
-if $is_composefs {
-    print "# TODO composefs: skipping test - fsck requires ostree-booted host"
-} else {
-    # That's it, just ensure we've run a fsck on our basic install.
-    bootc internals fsck
+if (tap is_composefs) {
+    # CI installs are consistent: every strict boot entry's image has
+    # fs-verity, so the boot entry check passes.
+    assert str contains $out "ok: composefs-boot-policy"
 }
 
 tap ok
