@@ -41,6 +41,7 @@ use rustix::{
     mount::{MountPropagationFlags, mount_change},
     thread::{UnshareFlags, unshare_unsafe},
 };
+use xshell::{Shell, cmd};
 
 /// How the repository is tampered with after the image has been written.
 #[derive(Clone, Copy, Debug)]
@@ -76,6 +77,8 @@ enum Expect {
     ReadEio,
     /// The mount is refused because the image has no fs-verity.
     VerityMissing,
+    /// The mount is refused because the filesystem doesn't support fs-verity.
+    FilesystemNotSupported,
     /// The mount is refused because the image found does not have the
     /// requested digest.
     DigestMismatch,
@@ -116,6 +119,18 @@ const RELAXED: &[(bool, Tamper, Expect)] = &[
     (false, Tamper::RefVerity, Expect::NotFound),
 ];
 
+/// On a filesystem without fs-verity support a repository can only be
+/// relaxed (meta.json without fs-verity), so only the cmdline varies. The
+/// first element is whether it carries the `?` marker.
+const UNSUPPORTED: &[(bool, Expect)] = &[
+    (false, Expect::FilesystemNotSupported),
+    (true, Expect::Original),
+];
+
+/// Size of the loop-mounted ext4 filesystem without fs-verity: small, but
+/// with room for the few tiny repositories the cases create.
+const NOVERITY_FS_SIZE: u64 = 32 * 1024 * 1024;
+
 fn replace(path: &Path, data: &[u8]) -> Result<()> {
     let copy = path.with_extension("replacement");
     fs::write(&copy, data)?;
@@ -152,6 +167,12 @@ fn is_expected_rejection(error: &anyhow::Error, expect: Expect) -> bool {
         Expect::DigestMismatch => matches!(
             error.downcast_ref::<CompareVerityError>(),
             Some(CompareVerityError::DigestMismatch { .. })
+        ),
+        Expect::FilesystemNotSupported => matches!(
+            error.downcast_ref::<CompareVerityError>(),
+            Some(CompareVerityError::Measure(
+                MeasureVerityError::FilesystemNotSupported
+            ))
         ),
         Expect::NotFound => error.downcast_ref::<ImageNotFound>().is_some(),
         Expect::Original | Expect::Replaced | Expect::ReadEio => false,
@@ -222,8 +243,11 @@ fn check_case(parent: &Path, case: Case) -> Result<()> {
     let mounted = mount_composefs_image(&sysroot, &digest, case.relaxed);
     let root = match case.expect {
         Expect::Original | Expect::Replaced | Expect::ReadEio => prepare_mount(mounted?)?,
-        Expect::VerityMissing | Expect::DigestMismatch | Expect::NotFound => {
-            let error = mounted.err().context("a tampered image was mounted")?;
+        Expect::VerityMissing
+        | Expect::FilesystemNotSupported
+        | Expect::DigestMismatch
+        | Expect::NotFound => {
+            let error = mounted.err().context("the mount unexpectedly succeeded")?;
             ensure!(
                 is_expected_rejection(&error, case.expect),
                 "Unexpected error: {error:#}"
@@ -246,28 +270,20 @@ fn check_case(parent: &Path, case: Case) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn run() -> Result<()> {
-    super::tap_begin("composefs initramfs verity enforcement");
-    // SAFETY: Only the mount namespace is unshared, not the file descriptor
-    // table. No descriptors become inaccessible to other threads.
-    #[allow(unsafe_code)]
-    unsafe { unshare_unsafe(UnshareFlags::NEWNS) }.context("Creating test mount namespace")?;
-    mount_change(
-        "/",
-        MountPropagationFlags::PRIVATE | MountPropagationFlags::REC,
-    )?;
-    // /tmp is commonly tmpfs; /var/tmp is on the persistent data filesystem.
-    let tmp = tempfile::tempdir_in("/var/tmp")?;
-    let probe = tmp.path().join("verity-probe");
+fn supports_fsverity(dir: &Path) -> Result<bool> {
+    let probe = dir.join("verity-probe");
     fs::write(&probe, b"probe")?;
-    match enable_verity_raw::<Sha512HashValue>(File::open(probe)?) {
-        Ok(()) => {}
-        Err(EnableVerityError::FilesystemNotSupported) => {
-            println!("ok # SKIP /var/tmp filesystem does not support fs-verity");
-            return Ok(());
-        }
+    let supported = match enable_verity_raw::<Sha512HashValue>(File::open(&probe)?) {
+        Ok(()) => true,
+        Err(EnableVerityError::FilesystemNotSupported) => false,
         Err(error) => return Err(error.into()),
-    }
+    };
+    fs::remove_file(&probe)?;
+    Ok(supported)
+}
+
+/// Run the cases that need fs-verity support in `parent`.
+fn check_supported(parent: &Path) -> Result<()> {
     let strict = [true, false].into_iter().flat_map(|metadata_verity| {
         STRICT.iter().map(move |&(tamper, expect)| Case {
             metadata_verity,
@@ -285,8 +301,62 @@ pub(crate) fn run() -> Result<()> {
             expect,
         });
     for case in strict.chain(relaxed) {
-        check_case(tmp.path(), case).with_context(|| format!("{case:?}"))?;
+        check_case(parent, case).with_context(|| format!("{case:?}"))?;
     }
+    Ok(())
+}
+
+/// Run the [`UNSUPPORTED`] cases on a loop-mounted ext4 filesystem created
+/// without the verity feature, as a stock `mkfs.ext4` makes it.
+fn check_unsupported(parent: &Path) -> Result<()> {
+    let sh = Shell::new()?;
+    let image = parent.join("noverity.img");
+    let mountpoint = parent.join("noverity");
+    File::create(&image)
+        .and_then(|f| f.set_len(NOVERITY_FS_SIZE))
+        .with_context(|| format!("Creating {}", image.display()))?;
+    cmd!(sh, "mkfs.ext4 -q -F -O ^verity {image}").run()?;
+    fs::create_dir(&mountpoint).with_context(|| format!("Creating {}", mountpoint.display()))?;
+    cmd!(sh, "mount -o loop {image} {mountpoint}").run()?;
+    let _umount = scopeguard::guard(&mountpoint, |mountpoint| {
+        if let Err(error) = cmd!(sh, "umount --lazy {mountpoint}").quiet().run() {
+            println!("# warning: {error}");
+        }
+    });
+    ensure!(
+        !supports_fsverity(&mountpoint)?,
+        "mkfs.ext4 -O ^verity made a filesystem with fs-verity support"
+    );
+    for &(relaxed, expect) in UNSUPPORTED {
+        let case = Case {
+            metadata_verity: false,
+            tamper: Tamper::None,
+            relaxed,
+            expect,
+        };
+        check_case(&mountpoint, case).with_context(|| format!("ext4 without verity: {case:?}"))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn run() -> Result<()> {
+    super::tap_begin("composefs initramfs verity enforcement");
+    // SAFETY: Only the mount namespace is unshared, not the file descriptor
+    // table. No descriptors become inaccessible to other threads.
+    #[allow(unsafe_code)]
+    unsafe { unshare_unsafe(UnshareFlags::NEWNS) }.context("Creating test mount namespace")?;
+    mount_change(
+        "/",
+        MountPropagationFlags::PRIVATE | MountPropagationFlags::REC,
+    )?;
+    // /tmp is commonly tmpfs; /var/tmp is on the persistent data filesystem.
+    let tmp = tempfile::tempdir_in("/var/tmp")?;
+    if supports_fsverity(tmp.path())? {
+        check_supported(tmp.path())?;
+    } else {
+        println!("# /var/tmp does not support fs-verity; skipping the cases that need it");
+    }
+    check_unsupported(tmp.path())?;
     super::tap_ok();
     Ok(())
 }
