@@ -1,7 +1,7 @@
 # number: 32
 # tmt:
 #   summary: Test bootc install to-filesystem with separate /var mount
-#   duration: 30m
+#   duration: 45m
 #   require:
 #     - parted
 #     - lvm2
@@ -28,6 +28,7 @@ bootc image copy-to-storage
 cat > /tmp/Containerfile.drop-lbis <<'EOF'
 FROM localhost/bootc as base
 RUN rm -rf /usr/lib/bootc/bound-images.d/*
+RUN mkdir -p /var/lib/bootc-defer-var-test && echo seed > /var/lib/bootc-defer-var-test/seed
 EOF
 
 is_composefs=$(bootc status --json | jq '.status.booted.composefs')
@@ -145,21 +146,25 @@ ROOT_UUID=$(blkid -s UUID -o value /dev/BL/root02)
 BOOT_UUID=$(blkid -s UUID -o value "$EFI_PART")
 
 # Mount the partitions
-mkdir -p /var/mnt/target
-mount /dev/BL/root02 /var/mnt/target
-mkdir -p /var/mnt/target/boot
-mount "$BOOT_PART" /var/mnt/target/boot
-mkdir -p /var/mnt/target/boot/efi
-mount "$EFI_PART" /var/mnt/target/boot/efi
+mount_target() {
+    mkdir -p /var/mnt/target
+    mount /dev/BL/root02 /var/mnt/target
+    mkdir -p /var/mnt/target/boot
+    mount "$BOOT_PART" /var/mnt/target/boot
+    mkdir -p /var/mnt/target/boot/efi
+    mount "$EFI_PART" /var/mnt/target/boot/efi
 
-# Create EFI directory structure with some files (simulating existing EFI content)
-mkdir -p /var/mnt/target/boot/efi/EFI/fedora
-touch /var/mnt/target/boot/efi/EFI/fedora/shimx64.efi
-touch /var/mnt/target/boot/efi/EFI/fedora/grubx64.efi
+    # Create EFI directory structure with some files (simulating existing EFI content)
+    mkdir -p /var/mnt/target/boot/efi/EFI/fedora
+    touch /var/mnt/target/boot/efi/EFI/fedora/shimx64.efi
+    touch /var/mnt/target/boot/efi/EFI/fedora/grubx64.efi
 
-# Critical: Mount /var as a separate partition
-mkdir -p /var/mnt/target/var
-mount /dev/BL/var02 /var/mnt/target/var
+    # Critical: Mount /var as a separate partition
+    mkdir -p /var/mnt/target/var
+    mount /dev/BL/var02 /var/mnt/target/var
+}
+
+mount_target
 
 echo "Filesystem layout:"
 mount | grep /var/mnt/target || true
@@ -181,21 +186,26 @@ if [[ $is_composefs != "null" ]]; then
     fi
 fi
 
-# Run bootc install to-filesystem from within the container image under test
-podman run \
-    --rm --privileged \
-    -v /var/mnt/target:/target \
-    -v /dev:/dev \
-    --pid=host \
-    --security-opt label=type:unconfined_t \
-    "$TARGET_IMAGE" \
-    bootc install to-filesystem \
-        --disable-selinux \
-        "${COMPOSEFS_BACKEND_PARAMS[@]}" \
-        "${KARGS[@]}" \
-        --root-mount-spec=UUID="$ROOT_UUID" \
-        --boot-mount-spec=UUID="$BOOT_UUID" \
-        /target
+run_install() {
+    # Run bootc install to-filesystem from within the container image under test
+    podman run \
+        --rm --privileged \
+        -v /var/mnt/target:/target \
+        -v /dev:/dev \
+        --pid=host \
+        --security-opt label=type:unconfined_t \
+        "$TARGET_IMAGE" \
+        bootc install to-filesystem \
+            --disable-selinux \
+            "${COMPOSEFS_BACKEND_PARAMS[@]}" \
+            "${KARGS[@]}" \
+            --root-mount-spec=UUID="$ROOT_UUID" \
+            --boot-mount-spec=UUID="$BOOT_UUID" \
+            "$@" \
+            /target
+}
+
+run_install
 
 # Verify the installation succeeded
 echo "Verifying installation..."
@@ -221,5 +231,38 @@ else
     fi
 fi
 
+# The image's /var is in the backend's state directory, hidden at boot by the
+# separate /var
+if [[ $is_composefs == "null" ]]; then
+    seeded_var=/var/mnt/target/ostree/deploy/default/var
+else
+    seeded_var=/var/mnt/target/state/os/default/var
+fi
+test "$(cat "$seeded_var/lib/bootc-defer-var-test/seed")" = seed
+test ! -e "$seeded_var/.bootc-defer-var"
+
+echo "--defer-var leaves the state directory unseeded"
+# Start over on fresh filesystems, keeping their UUIDs
+umount -R /var/mnt/target
+mkfs.vfat -F32 -i "$(blkid -s UUID -o value "$EFI_PART" | tr -d -)" "$EFI_PART"
+mkfs.ext4 -F -U "$(blkid -s UUID -o value "$BOOT_PART")" "$BOOT_PART"
+mkfs.ext4 -F -U "$ROOT_UUID" /dev/BL/root02
+mkfs.ext4 -F /dev/BL/var02
+if [[ $is_composefs != "null" ]]; then
+    tune2fs -O verity /dev/BL/var02
+    tune2fs -O verity /dev/BL/root02
+fi
+mount_target
+run_install --defer-var
+# Only bootc's marker, and on ostree the stamp libostree writes when it
+# labels /var on the first deployment
+if [[ $is_composefs == "null" ]]; then
+    test "$(ls -A "$seeded_var" | sort | xargs)" = ".bootc-defer-var .ostree-selabeled"
+else
+    test "$(ls -A "$seeded_var")" = .bootc-defer-var
+fi
+test ! -s "$seeded_var/.bootc-defer-var"
+# The separate /var is left alone, as without --defer-var
+test -z "$(ls -A /var/mnt/target/var | grep -v '^lost+found$')"
 
 echo "Installation to-filesystem with separate /var mount succeeded!"
