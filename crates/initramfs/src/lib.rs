@@ -414,7 +414,12 @@ pub fn mount_composefs_image(
     Ok(rootfs)
 }
 
-fn parse_composefs_candidates(cmdline: &str) -> Result<Vec<ComposefsCmdline<Sha512HashValue>>> {
+/// Parse the composefs candidates (`composefs.digest=` and `composefs=`) from a
+/// kernel command line, in command-line order.
+///
+/// This is how `setup_root` reads the command line; `bootc internals fsck`
+/// uses it too, so that it checks boot entries the way they are booted.
+pub fn parse_composefs_candidates(cmdline: &str) -> Result<Vec<ComposefsCmdline<Sha512HashValue>>> {
     let mut candidates = Vec::new();
     let mut seen_legacy = false;
 
@@ -445,7 +450,29 @@ fn parse_composefs_candidates(cmdline: &str) -> Result<Vec<ComposefsCmdline<Sha5
     Ok(candidates)
 }
 
-fn select_composefs_candidate<T>(
+/// The fs-verity policy of a boot: whether missing fs-verity is allowed.
+///
+/// All candidates must agree, since `setup_root` mounts whichever one exists.
+pub fn composefs_candidates_policy(
+    candidates: &[ComposefsCmdline<Sha512HashValue>],
+) -> Result<bool> {
+    let Some(first) = candidates.first() else {
+        anyhow::bail!("No composefs image in cmdline");
+    };
+    let allow_missing_fsverity = first.is_insecure();
+    if candidates
+        .iter()
+        .any(|candidate| candidate.is_insecure() != allow_missing_fsverity)
+    {
+        anyhow::bail!("composefs candidates have mixed fs-verity policy");
+    }
+    Ok(allow_missing_fsverity)
+}
+
+/// Try the candidates in order with `mount`, returning the first result it
+/// gives and its candidate. `mount` returns `None` for a candidate whose image
+/// doesn't exist, so that the next one is tried.
+pub fn select_composefs_candidate<T>(
     candidates: &[ComposefsCmdline<Sha512HashValue>],
     mut mount: impl FnMut(&ComposefsCmdline<Sha512HashValue>) -> Result<Option<T>>,
 ) -> Result<(T, ComposefsCmdline<Sha512HashValue>)> {
@@ -593,16 +620,7 @@ pub fn setup_root(args: Args) -> Result<()> {
 
     let candidates =
         parse_composefs_candidates(&cmdline).context("Failed to parse composefs cmdline")?;
-    if candidates.is_empty() {
-        anyhow::bail!("No composefs image in cmdline");
-    }
-    let allow_missing_fsverity = candidates[0].is_insecure();
-    if candidates
-        .iter()
-        .any(|candidate| candidate.is_insecure() != allow_missing_fsverity)
-    {
-        anyhow::bail!("composefs candidates have mixed fs-verity policy");
-    }
+    let allow_missing_fsverity = composefs_candidates_policy(&candidates)?;
 
     let (new_root, composefs_info) = match &args.root_fs {
         Some(path) => (
@@ -932,6 +950,29 @@ mod tests {
             assert!(
                 parse_composefs_candidates(cmdline).unwrap().is_empty(),
                 "irrelevant argument was treated as a candidate: {cmdline}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_composefs_candidates_policy() {
+        let strict = v1(Sha512HashValue::EMPTY, false);
+        let relaxed = v2(Sha512HashValue::EMPTY, true);
+        let cases = [
+            (String::new(), None),
+            (strict.clone(), Some(false)),
+            (
+                format!("{relaxed} {}", v1(Sha512HashValue::EMPTY, true)),
+                Some(true),
+            ),
+            (format!("{strict} {relaxed}"), None),
+        ];
+        for (cmdline, expected) in cases {
+            let candidates = parse_composefs_candidates(&cmdline).unwrap();
+            assert_eq!(
+                composefs_candidates_policy(&candidates).ok(),
+                expected,
+                "{cmdline:?}"
             );
         }
     }

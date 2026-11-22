@@ -221,8 +221,10 @@ and may change or be removed:
   partition is only used with systemd-boot; see
   [Bootloaders](bootc-bootloaders.7.md#xbootldr-partitions).
 - Rollback with GRUB and UKIs assumes exactly two deployments.
-- `bootc internals fsck` doesn't yet comprehensively cover the composefs
-  backend; see [#2497](https://github.com/bootc-dev/bootc/pull/2497).
+- `bootc internals fsck` only checks the composefs boot entries (see
+  [bootc-experimental-fsck(7)](bootc-experimental-fsck.7.md)), not the
+  composefs repository or deployments; see
+  [#2497](https://github.com/bootc-dev/bootc/pull/2497).
 
 For building and testing bootc itself with the composefs backend, see
 [CONTRIBUTING.md](https://github.com/bootc-dev/bootc/blob/main/CONTRIBUTING.md).
