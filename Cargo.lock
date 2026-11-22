@@ -4362,6 +4362,7 @@ dependencies = [
  "owo-colors",
  "pulldown-cmark",
  "rand 0.10.3",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml",

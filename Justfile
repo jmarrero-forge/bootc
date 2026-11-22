@@ -298,6 +298,19 @@ test-upgrade *ARGS: build _build-upgrade-source-image
         "${composefs_args[@]}" \
         {{upgrade_source_img}} {{ARGS}} readonly
 
+# Run an upgrade test from a pinned bootc release, FROM (a tag such as
+# v1.16.0, or "latest"): build that release onto the base image, install
+# with its bootc, upgrade to the locally-built image and check the result.
+# Unlike test-upgrade, the old side doesn't float with the base image.
+# ARGS go to `cargo xtask test-upgrade-pinned`, e.g. --installer=to-filesystem.
+[group('testing')]
+test-upgrade-pinned FROM *ARGS: build _build-upgrade-source-image _build-upgrade-image
+    cargo xtask test-upgrade-pinned --from={{FROM}} --base={{base}} \
+        --source-image={{upgrade_source_img}} --upgrade-image={{upgrade_img}} \
+        --pinned-image={{base_img}}-pinned \
+        --variant={{variant}} --bootloader={{bootloader}} --filesystem={{filesystem}} \
+        --boot-type={{boot_type}} {{ARGS}} {{base_img}}
+
 # Run all validation checks: tmt plan staleness (local), then fmt/clippy/man/schema (container)
 [group('core')]
 validate:

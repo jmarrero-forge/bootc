@@ -1,0 +1,98 @@
+# Build an upgrade source image with a released bootc, for the
+# pinned-version upgrade tests (`just test-upgrade-pinned`).
+#
+# The release is built from its own sources, the `pinned-src` build context
+# (a `git archive` of its tag), with its own contrib/packaging/install-buildroot
+# and contrib/packaging/build-rpm, which have kept the same interface since
+# v1.15.0. Its own Dockerfile isn't used: it fetches things that move (v1.16.x
+# downloads grub2-efi-x64-cc from ELN, which no longer has it), and it keeps
+# target/ in a cache mount shared with every other build of bootc on the host,
+# from which cargo can reuse another version's binaries.
+#
+# The RPMs then replace the bootc packages of `source`, the upgrade source
+# image (the current base image plus the tmt dependencies, see
+# Dockerfile.upgrade-source). So the old bootc runs on current OS content,
+# which is what a system that has kept its bootc back looks like.
+ARG base=quay.io/centos-bootc/centos-bootc:stream10
+ARG source=localhost/bootc-upgrade-source
+
+FROM scratch AS packaging
+COPY contrib/packaging /
+
+FROM scratch AS pinned-packaging
+COPY --from=pinned-src /contrib/packaging /
+
+FROM ${base} AS buildroot
+# The release's packaging comes in through a bind mount, which isn't part of
+# the layer cache key; this is, so another release's buildroot isn't reused.
+ARG pinned_commit
+RUN --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
+    --mount=type=bind,from=pinned-packaging,src=/,target=/run/packaging \
+    echo "Buildroot for bootc ${pinned_commit}" && /run/packaging/install-buildroot
+
+FROM buildroot AS build
+ARG pkgversion
+ARG SOURCE_DATE_EPOCH
+ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
+COPY --from=pinned-src / /src
+# No cache mount for target/ (see above), so drop it once the RPMs are out.
+RUN --mount=type=tmpfs,target=/tmp <<EORUN
+set -xeuo pipefail
+cd /src
+cargo fetch
+RPM_VERSION="${pkgversion}" contrib/packaging/build-rpm /out /src
+rm -rf /src/target /var/roothome/.cargo
+EORUN
+
+# The stream10 base images don't ship systemd-boot. As for the test images,
+# take it from systemd-boot-unsigned; it isn't signed here, so these images
+# only boot with Secure Boot off.
+FROM ${source} AS sdboot
+ARG bootloader=grub
+RUN --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
+    --mount=type=bind,from=packaging,src=/,target=/run/packaging <<EORUN
+set -xeuo pipefail
+mkdir -p /out
+if [[ "${bootloader}" == "systemd" ]]; then
+  /run/packaging/initialize-sealing-tools
+  cd /tmp
+  rpm2cpio /out/systemd-boot-unsigned-*.rpm | cpio -idm
+  cp ./usr/lib/systemd/boot/efi/systemd-boot*.efi /out/
+fi
+EORUN
+
+FROM ${source}
+ARG variant=ostree
+ARG bootloader=grub
+# As for the buildroot: the RPMs come in through a bind mount.
+ARG pinned_ref
+ARG pinned_commit
+RUN --network=none --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
+    --mount=type=bind,from=build,src=/out,target=/run/pinned-rpms \
+    --mount=type=bind,from=sdboot,src=/,target=/run/sdboot \
+    --mount=type=bind,from=packaging,src=/,target=/run/packaging <<EORUN
+set -xeuo pipefail
+echo "Installing bootc ${pinned_ref} (${pinned_commit})"
+# Replace bootc and those of its subpackages the base image has.
+rpms=()
+for rpm in /run/pinned-rpms/*.rpm; do
+  name=$(rpm -qp --qf '%{NAME}' "${rpm}")
+  if [[ "${name}" == bootc ]] || rpm -q "${name}" >/dev/null; then
+    rpms+=("${rpm}")
+  fi
+done
+rpm -Uvh --oldpackage --replacepkgs "${rpms[@]}"
+bootc --version
+
+if [[ "${bootloader}" == "systemd" ]]; then
+  /run/packaging/switch-to-sdboot /run/sdboot
+fi
+
+# The composefs backend boots with the release's own initramfs module, as
+# Dockerfile.upgrade-source configured it.
+if [[ "${variant}" == composefs* ]]; then
+  kver=$(cd /usr/lib/modules && echo *)
+  dracut --force --kver "$kver" "/usr/lib/modules/$kver/initramfs.img"
+fi
+EORUN
+LABEL bootc.test.pinned-ref="${pinned_ref}" bootc.test.pinned-commit="${pinned_commit}"

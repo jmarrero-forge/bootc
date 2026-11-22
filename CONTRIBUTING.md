@@ -88,6 +88,13 @@ To run a specific test:
 just test-tmt readonly
 ```
 
+`just test-upgrade` upgrades from the bootc that the published base image
+ships. To upgrade from a given bootc release instead (a tag, or `latest`):
+
+```bash
+BOOTC_variant=composefs BOOTC_bootloader=systemd just test-upgrade-pinned v1.16.14
+```
+
 ### Faster iteration cycles
 
 The test cycle currently builds a disk image and creates a new ephemeral

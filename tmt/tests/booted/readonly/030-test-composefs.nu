@@ -7,6 +7,21 @@ def parse_cmdline []  {
     open /proc/cmdline | str trim | split row " "
 }
 
+# Whether the bootc that installed this system takes loader.conf from the
+# image (1.17.4 and later): the current one, or the one an upgrade test
+# started from (see maybe_upgrade in bootc_testlib.nu)
+def installed_by_bootc_with_image_loader_conf [] {
+    let pre_upgrade = "/var/bootc-pre-upgrade-version"
+    if not ($pre_upgrade | path exists) {
+        return true
+    }
+    let v = try { open $pre_upgrade | str trim | split row "." | first 3 | each { into int } } catch { [] }
+    if ($v | length) != 3 {
+        return true
+    }
+    ($v.0 > 1) or ($v.0 == 1 and ($v.1 > 17 or ($v.1 == 17 and $v.2 >= 4)))
+}
+
 def find_root_eq_in_cmdline [bootloader: string] {
     let cmdline = parse_cmdline
     let has_root_param = ($cmdline | any { |param| $param | str starts-with 'root=' })
@@ -35,7 +50,11 @@ if $expecting_composefs {
             mkdir /var/tmp/efi
             mount /dev/disk/by-partlabel/EFI-SYSTEM /var/tmp/efi
 
-            assert (open /var/tmp/efi/loader/loader.conf | lines | any {|s| $s == "timeout 1" })
+            # loader.conf is written at install time, and bootc before 1.17.4
+            # wrote its own; in upgrade tests, an older bootc did the install.
+            if (installed_by_bootc_with_image_loader_conf) {
+                assert (open /var/tmp/efi/loader/loader.conf | lines | any {|s| $s == "timeout 1" })
+            }
 
             find_root_eq_in_cmdline "systemd-boot"
         }

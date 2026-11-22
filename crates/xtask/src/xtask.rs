@@ -19,6 +19,7 @@ use xshell::{Shell, cmd};
 mod bcvk;
 mod buildsys;
 mod man;
+mod pinned;
 mod sysext;
 mod tmt;
 
@@ -108,6 +109,8 @@ enum Commands {
     RunTmt(RunTmtArgs),
     /// Provision a VM for manual TMT testing
     TmtProvision(TmtProvisionArgs),
+    /// Install a pinned bootc release, upgrade it to the image under test and check it
+    TestUpgradePinned(PinnedUpgradeArgs),
     /// Check build system properties (e.g., reproducible builds)
     CheckBuildsys,
     /// Validate composefs digests match between build-time and install-time views
@@ -344,6 +347,73 @@ impl RunTmtArgs {
     }
 }
 
+/// How a pinned-version upgrade test installs the release.
+/// image-builder and Anaconda installs are meant to become more values here.
+#[derive(Debug, Default, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub(crate) enum Installer {
+    /// `bootc install to-disk` (via `bcvk libvirt run`), then the tmt
+    /// `readonly` plan after the upgrade
+    #[default]
+    ToDisk,
+    /// `bootc install to-filesystem` onto a root filesystem made by the stock
+    /// mkfs (for ext4, without fs-verity), as Anaconda or a cloud image would
+    ToFilesystem,
+}
+
+/// Arguments for the test-upgrade-pinned command
+#[derive(Debug, Args)]
+pub(crate) struct PinnedUpgradeArgs {
+    /// The image under test, to upgrade to (e.g. "localhost/bootc")
+    pub(crate) image: String,
+
+    /// The bootc release to install from: a tag such as v1.16.0, or "latest"
+    #[arg(long)]
+    pub(crate) from: String,
+
+    /// How the release installs
+    #[arg(long, value_enum, default_value_t)]
+    pub(crate) installer: Installer,
+
+    /// Base image to build the release in
+    #[arg(long, env = "BOOTC_base")]
+    pub(crate) base: String,
+
+    /// The upgrade source image (the base image with the tmt dependencies)
+    /// that gets the release's bootc
+    #[arg(long)]
+    pub(crate) source_image: String,
+
+    /// Name of the image with the release's bootc; it is tagged with the release
+    #[arg(long, default_value = "localhost/bootc-pinned")]
+    pub(crate) pinned_image: String,
+
+    /// For to-filesystem installs: a second image to upgrade to afterwards
+    #[arg(long, default_value = "localhost/bootc-upgrade")]
+    pub(crate) upgrade_image: String,
+
+    /// Backend: ostree or composefs
+    #[arg(long, env = "BOOTC_variant", default_value = "ostree")]
+    pub(crate) variant: String,
+
+    #[arg(long, env = "BOOTC_bootloader", default_value = "grub")]
+    pub(crate) bootloader: Bootloader,
+
+    /// Root filesystem (composefs only; ostree uses the image's default)
+    #[arg(long, env = "BOOTC_filesystem", default_value = "ext4")]
+    pub(crate) filesystem: String,
+
+    #[arg(long, env = "BOOTC_boot_type", default_value_t)]
+    pub(crate) boot_type: BootType,
+
+    /// Keep the VMs after the test
+    #[arg(long)]
+    pub(crate) preserve_vm: bool,
+
+    /// Base directory for VM logs; as for run-tmt
+    #[arg(long)]
+    pub(crate) log_dir: Option<camino::Utf8PathBuf>,
+}
+
 /// Arguments for tmt-provision command
 #[derive(Debug, Args)]
 pub(crate) struct TmtProvisionArgs {
@@ -438,6 +508,7 @@ fn try_main() -> Result<()> {
             tmt::run_tmt(&sh, &args)
         }
         Commands::TmtProvision(args) => tmt::tmt_provision(&sh, &args),
+        Commands::TestUpgradePinned(args) => pinned::test_upgrade_pinned(&sh, &args),
         Commands::CheckBuildsys => buildsys::check_buildsys(&sh, "Dockerfile".into()),
         Commands::ValidateComposefsDigest(args) => validate_composefs_digest(&sh, &args),
         Commands::LocalRustDeps(args) => local_rust_deps(&sh, &args),

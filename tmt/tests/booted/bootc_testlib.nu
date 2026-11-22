@@ -24,6 +24,34 @@ export def parse_cmdline []  {
     open /proc/cmdline | str trim | split row " "
 }
 
+# For the pinned-version upgrade tests (`just test-upgrade-pinned`, which
+# sets BOOTC_test_pinned_version): check that the bootc release under test
+# made this install, record which build it was, and check the verdict of the
+# pre-upgrade check script, which must not flag an install made by to-disk.
+def check_pinned_source [booted_version: string] {
+    use std assert
+
+    let pinned = $env.BOOTC_test_pinned_version? | default ""
+    if $pinned == "" {
+        return
+    }
+    assert equal $booted_version $pinned "the system must run the pinned bootc release"
+    let proof = {
+        version: $booted_version,
+        rpm: (rpm -q --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}' bootc | str trim),
+        sha256: (open --raw /usr/bin/bootc | hash sha256),
+    }
+    $proof | to json | save --force /var/bootc-pinned-proof.json
+    print $"Pinned bootc: ($proof | to nuon)"
+
+    let st = bootc status --json | from json
+    if $st.status.booted.composefs? != null {
+        let check = do -i { bash booted/check-strict-verity.sh } | complete
+        print $"Pre-upgrade check: ($check.stdout | str trim)"
+        assert equal $check.exit_code 0 "the pre-upgrade check must find a to-disk install unaffected"
+    }
+}
+
 # If the BOOTC_test_upgrade_image environment variable is set, performs
 # an upgrade to that image and reboots on the first boot. On the second
 # boot (after the upgrade), verifies we're running the upgraded image
@@ -55,6 +83,7 @@ export def maybe_upgrade [] {
             let pre_ver = (bootc --version | parse "bootc {v}" | get 0.v)
             $pre_ver | save /var/bootc-pre-upgrade-version
             print $"Pre-upgrade bootc version: ($pre_ver)"
+            check_pinned_source $pre_ver
 
             print $"Upgrade image specified: ($upgrade_image)"
             print "Performing upgrade switch..."
